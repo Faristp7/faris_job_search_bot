@@ -1,16 +1,17 @@
-import feedparser
 import requests
 import json
 import os
 import logging
 import re
+from urllib.parse import quote
 import time
 import asyncio
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEEN_JOBS_FILE, CHECK_INTERVAL_MINUTES,
-    INDEED_SEARCHES, GLASSDOOR_KEYWORDS, CUTSHORT_KEYWORDS, INFOPARK_SEARCH_URL
+    GLASSDOOR_KEYWORDS, CUTSHORT_KEYWORDS, INFOPARK_SEARCH_URL,
+    REMOTIVE_KEYWORDS, JOBICY_KEYWORDS, THEMUSE_CATEGORIES
 )
 from scorer import score_job, MIN_SCORE
 from telegram import Update
@@ -376,13 +377,15 @@ def format_job_message(title, company, location, link, source, score_data: dict,
 
     source_emoji = {
         "LinkedIn": "💼",
-        "Naukri": "🟠",
         "Wellfound": "🚀",
         "Internshala": "🎓",
-        "Indeed": "🔵",
         "Glassdoor": "🟢",
         "Cutshort": "✂️",
-        "Infopark": "🏢"
+        "Infopark": "🏢",
+        "Remotive": "🌍",
+        "Jobicy": "💻",
+        "Arbeitnow": "🌐",
+        "TheMuse": "🎯"
     }.get(source_esc, "📌")
 
     # FIXED: protection against None score_data
@@ -496,73 +499,37 @@ def scrape_linkedin(seen) -> list:
     return found
 
 
-NAUKRI_SEARCHES = [
-    ("NestJS developer", "Kerala"),
-    ("Node.js React full stack", "Kerala"),
-    ("full stack developer", "Kochi"),
-    ("NestJS Node.js", "India"),
-]
-
-def scrape_naukri(seen: OrderedSet) -> list:
+def scrape_remotive(seen: OrderedSet) -> list:
     found = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "appid": "109",
-        "systemid": "Naukri",
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
-    for keyword, location in NAUKRI_SEARCHES:
+    for keyword in REMOTIVE_KEYWORDS:
         try:
-            kw_encoded = keyword.replace(" ", "%20")
-            loc_encoded = location.replace(" ", "%20")
-            api_url = (
-                f"https://www.naukri.com/jobapi/v3/search?"
-                f"noOfResults=20&urlType=search_by_keyword&searchType=adv"
-                f"&keyword={kw_encoded}&location={loc_encoded}&pageNo=1"
-            )
-            r = requests.get(api_url, headers=headers, timeout=15)
-            if r.status_code == 406 and "recaptcha" in r.text.lower():
-                log.warning("Naukri scrape blocked: ReCAPTCHA challenge required.")
-                continue
+            kw_encoded = quote(keyword)
+            url = f"https://remotive.com/api/remote-jobs?search={kw_encoded}&limit=20"
+            r = requests.get(url, headers=headers, timeout=15)
             r.raise_for_status()
             data = r.json()
-            
-            # FIXED: json and list type safety
+
             if not isinstance(data, dict):
                 continue
-            jobs = data.get("jobDetails", [])
+            jobs = data.get("jobs", [])
             if not isinstance(jobs, list):
                 continue
 
             for job in jobs:
-                try:  # FIXED: wrap inner loop in exception block
+                try:
                     if not isinstance(job, dict):
                         continue
                     title = job.get("title", "N/A")
-                    company = job.get("companyName", "N/A")
-                    placeholders = job.get("placeholders", [])
-                    if not isinstance(placeholders, list):
-                        placeholders = []
-                    location_str = "India"
-                    salary_str = None
-                    for p in placeholders:
-                        if not isinstance(p, dict):
-                            continue
-                        ptype = p.get("type")
-                        plabel = p.get("label")
-                        if ptype == "location" and plabel:
-                            location_str = ", ".join(str(plabel).split(",")[:2])
-                        elif ptype == "salary" and plabel:
-                            salary_str = str(plabel)
-                    
-                    # Fallback for location (original logic fallback)
-                    if location_str == "India" and placeholders:
-                        location_str = ", ".join(placeholders[0].get("label", "").split(",")[:2])
-                    
-                    link = job.get("jdURL", "https://www.naukri.com")
-                    job_id = f"naukri_{job.get('jobId', link)}"
+                    company = job.get("company_name", "N/A")
+                    location = job.get("candidate_required_location", "Remote")
+                    link = job.get("url", "")
 
+                    if not link or title == "N/A":
+                        continue
+
+                    job_id = f"remotive_{link}"
                     if job_id in seen:
                         continue
                     if not matches_keywords(title):
@@ -571,14 +538,187 @@ def scrape_naukri(seen: OrderedSet) -> list:
                     seen.add(job_id)
                     found.append({
                         "title": title, "company": company,
-                        "location": location_str, "link": link, "source": "Naukri",
-                        "salary": salary_str
+                        "location": location, "link": link, "source": "Remotive",
+                        "salary": None
                     })
                 except Exception as e:
-                    log.warning(f"Error parsing Naukri job: {e}")
+                    log.warning(f"Error parsing Remotive job: {e}")
 
+            time.sleep(1)
         except Exception as e:
-            log.warning(f"Naukri scrape error ({keyword}): {e}")
+            log.warning(f"Remotive scrape error ({keyword}): {e}")
+
+    return found
+
+
+def scrape_jobicy(seen: OrderedSet) -> list:
+    found = []
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+    for keyword in JOBICY_KEYWORDS:
+        try:
+            kw_encoded = quote(keyword)
+            url = f"https://jobicy.com/api/v2/remote-jobs?tag={kw_encoded}&count=20"
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+
+            if not isinstance(data, dict):
+                continue
+            jobs = data.get("jobs", [])
+            if not isinstance(jobs, list):
+                continue
+
+            for job in jobs:
+                try:
+                    if not isinstance(job, dict):
+                        continue
+                    title = job.get("jobTitle", "N/A")
+                    company = job.get("companyName", "N/A")
+                    location = job.get("jobGeo", "Remote")
+                    link = job.get("url", "")
+
+                    if not link or title == "N/A":
+                        continue
+
+                    job_id = f"jobicy_{link}"
+                    if job_id in seen:
+                        continue
+                    if not matches_keywords(title):
+                        continue
+
+                    seen.add(job_id)
+                    found.append({
+                        "title": title, "company": company,
+                        "location": location, "link": link, "source": "Jobicy",
+                        "salary": None
+                    })
+                except Exception as e:
+                    log.warning(f"Error parsing Jobicy job: {e}")
+
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"Jobicy scrape error ({keyword}): {e}")
+
+    return found
+
+
+def scrape_arbeitnow(seen: OrderedSet) -> list:
+    found = []
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+    try:
+        url = "https://www.arbeitnow.com/api/job-board-api"
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        if not isinstance(data, dict):
+            return []
+        jobs = data.get("data", [])
+        if not isinstance(jobs, list):
+            return []
+
+        for job in jobs:
+            try:
+                if not isinstance(job, dict):
+                    continue
+                title = job.get("title", "N/A")
+                company = job.get("company_name", "N/A")
+                location = job.get("location", "Remote")
+                link = job.get("url", "")
+                tags = job.get("tags", [])
+
+                if not link or title == "N/A":
+                    continue
+
+                job_id = f"arbeitnow_{link}"
+                if job_id in seen:
+                    continue
+
+                is_match = matches_keywords(title)
+                if not is_match and isinstance(tags, list):
+                    for tag in tags:
+                        if matches_keywords(tag):
+                            is_match = True
+                            break
+
+                if not is_match:
+                    continue
+
+                seen.add(job_id)
+                found.append({
+                    "title": title, "company": company,
+                    "location": location, "link": link, "source": "Arbeitnow",
+                    "salary": None
+                })
+            except Exception as e:
+                log.warning(f"Error parsing Arbeitnow job: {e}")
+    except Exception as e:
+        log.warning(f"Arbeitnow scrape error: {e}")
+
+    return found
+
+
+def scrape_themuse(seen: OrderedSet) -> list:
+    found = []
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+    for category in THEMUSE_CATEGORIES:
+        try:
+            cat_encoded = quote(category)
+            # The Muse API is 0-indexed for page number (page=0 is the first page of results)
+            url = f"https://www.themuse.com/api/public/jobs?category={cat_encoded}&level=Mid%20Level&page=0"
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+
+            if not isinstance(data, dict):
+                continue
+            results = data.get("results", [])
+            if not isinstance(results, list):
+                continue
+
+            for job in results:
+                try:
+                    if not isinstance(job, dict):
+                        continue
+                    title = job.get("name", "N/A")
+
+                    company_data = job.get("company")
+                    company = company_data.get("name", "N/A") if isinstance(company_data, dict) else "N/A"
+
+                    locations = job.get("locations")
+                    location = "Remote"
+                    if isinstance(locations, list) and locations:
+                        first_loc = locations[0]
+                        if isinstance(first_loc, dict):
+                            location = first_loc.get("name", "Remote")
+
+                    refs = job.get("refs")
+                    link = refs.get("landing_page", "") if isinstance(refs, dict) else ""
+
+                    if not link or title == "N/A":
+                        continue
+
+                    job_id = f"themuse_{link}"
+                    if job_id in seen:
+                        continue
+                    if not matches_keywords(title):
+                        continue
+
+                    seen.add(job_id)
+                    found.append({
+                        "title": title, "company": company,
+                        "location": location, "link": link, "source": "TheMuse",
+                        "salary": None
+                    })
+                except Exception as e:
+                    log.warning(f"Error parsing The Muse job: {e}")
+
+            time.sleep(1)
+        except Exception as e:
+            log.warning(f"The Muse scrape error ({category}): {e}")
 
     return found
 
@@ -590,53 +730,8 @@ WELLFOUND_SEARCHES = [
 ]
 
 def scrape_wellfound(seen: OrderedSet) -> list:
-    found = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    }
-
-    for role in WELLFOUND_SEARCHES:
-        try:
-            url = f"https://wellfound.com/role/r/{role}"
-            r = requests.get(url, headers=headers, timeout=15)
-            if r.status_code == 403 or "captcha-delivery" in r.text:
-                log.warning(f"Wellfound scrape blocked by Captcha/Anti-bot (status {r.status_code}).")
-                continue
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            listings = soup.select("div[class*='JobListing']") or soup.select("div[data-test='StartupResult']")
-
-            for item in listings[:10]:
-                try:
-                    title_el = item.select_one("a[class*='jobTitle'], span[class*='title']")
-                    company_el = item.select_one("a[class*='startup'], span[class*='company']")
-                    link_el = item.select_one("a[href*='/jobs/']")
-
-                    title = title_el.text.strip() if title_el else role.replace("-", " ").title()
-                    company = company_el.text.strip() if company_el else "Startup"
-                    link = f"https://wellfound.com{link_el['href']}" if link_el else url
-                    job_id = f"wellfound_{link}"
-
-                    if job_id in seen:
-                        continue
-                    if not matches_keywords(title + " " + role):
-                        continue
-
-                    seen.add(job_id)
-                    found.append({
-                        "title": title, "company": company,
-                        "location": "Remote / India", "link": link, "source": "Wellfound",
-                        "salary": None
-                    })
-                except Exception:
-                    continue
-
-        except Exception as e:
-            log.warning(f"Wellfound scrape error ({role}): {e}")
-
-    return found
+    log.info("Wellfound scraper disabled (Cloudflare protected). Skipping.")
+    return []
 
 
 INTERNSHALA_SEARCHES = [
@@ -692,101 +787,6 @@ def scrape_internshala(seen: OrderedSet) -> list:
             log.warning(f"Internshala scrape error ({category}): {e}")
 
     return found
-
-
-def scrape_indeed(seen: OrderedSet) -> list:
-    found = []
-
-    for keyword, location_query in INDEED_SEARCHES:
-        try:
-            kw_encoded = keyword.replace(" ", "%20")
-            loc_encoded = location_query.replace(" ", "%20")
-            url = f"https://in.indeed.com/rss?q={kw_encoded}&l={loc_encoded}&sort=date"
-            
-            feedparser.USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            feed = feedparser.parse(url)
-            
-            if feed.bozo and not feed.entries:
-                log.warning(f"Indeed RSS parse failed for {keyword} in {location_query}")
-                continue
-            
-            for entry in feed.entries:
-                title_raw = entry.get("title")
-                author_raw = entry.get("author")
-                location_raw = entry.get("location")
-                link_raw = entry.get("link")
-                
-                # Normalize title
-                if isinstance(title_raw, list) and title_raw:
-                    first = title_raw[0]
-                    title = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
-                else:
-                    title = str(title_raw) if title_raw is not None else "N/A"
-                title = str(title).strip()
-                
-                # Normalize company
-                if isinstance(author_raw, list) and author_raw:
-                    first = author_raw[0]
-                    company = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
-                else:
-                    company = str(author_raw) if author_raw is not None else "Indeed"
-                company = str(company).strip()
-                
-                # Normalize location
-                if isinstance(location_raw, list) and location_raw:
-                    first = location_raw[0]
-                    location = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
-                else:
-                    location = str(location_raw) if location_raw is not None else location_query
-                location = str(location).strip()
-                
-                # Normalize link
-                if isinstance(link_raw, list) and link_raw:
-                    first = link_raw[0]
-                    if isinstance(first, dict):
-                        link = first.get("href") or first.get("value") or str(first)
-                    else:
-                        link = str(first)
-                elif isinstance(link_raw, dict):
-                    link = link_raw.get("href") or link_raw.get("value") or str(link_raw)
-                else:
-                    link = str(link_raw) if link_raw is not None else ""
-                
-                if isinstance(link, list):
-                    link = link[0] if link else ""
-                link = str(link).strip()
-                
-                # Split by " - " as fallback
-                if (company == "Indeed" or location == location_query) and " - " in title:
-                    parts = [p.strip() for p in title.split(" - ")]
-                    if len(parts) >= 3:
-                        title = parts[0]
-                        company = parts[1]
-                        location = parts[2]
-                    elif len(parts) == 2:
-                        title = parts[0]
-                        company = parts[1]
-                        
-                if not title or title == "N/A" or not link:
-                    continue
-                    
-                job_id = f"indeed_{link}"
-                if job_id in seen:
-                    continue
-                if not matches_keywords(title):
-                    continue
-                    
-                seen.add(job_id)
-                found.append({
-                    "title": title, "company": company,
-                    "location": location, "link": link, "source": "Indeed",
-                    "salary": None
-                })
-        except Exception as e:
-            log.warning(f"Indeed scrape error for {keyword} in {location_query}: {e}")
-            
-    return found
-
 
 def scrape_glassdoor(seen: OrderedSet) -> list:
     found = []
@@ -861,7 +861,7 @@ def scrape_glassdoor(seen: OrderedSet) -> list:
 
 
 def scrape_cutshort(seen: OrderedSet) -> list:
-    log.warning("Cutshort API scraper is deprecated (endpoint returned 404/Not Found). Skipping Cutshort.")
+    log.info("Cutshort scraper disabled (API deprecated). Skipping.")
     return []
 
 
@@ -944,14 +944,6 @@ async def run_scraper_async(application):
     await asyncio.sleep(2)
         
     try:
-        naukri_jobs = await asyncio.to_thread(scrape_naukri, seen)
-    except Exception as e:
-        log.error(f"Naukri scrape task failed: {e}")
-        naukri_jobs = []
-        
-    await asyncio.sleep(2)
-        
-    try:
         wellfound_jobs = await asyncio.to_thread(scrape_wellfound, seen)
     except Exception as e:
         log.error(f"Wellfound scrape task failed: {e}")
@@ -964,14 +956,6 @@ async def run_scraper_async(application):
     except Exception as e:
         log.error(f"Internshala scrape task failed: {e}")
         internshala_jobs = []
-        
-    await asyncio.sleep(2)
-    
-    try:
-        indeed_jobs = await asyncio.to_thread(scrape_indeed, seen)
-    except Exception as e:
-        log.error(f"Indeed scrape task failed: {e}")
-        indeed_jobs = []
         
     await asyncio.sleep(2)
     
@@ -997,9 +981,42 @@ async def run_scraper_async(application):
         log.error(f"Infopark scrape task failed: {e}")
         infopark_jobs = []
         
+    await asyncio.sleep(2)
+    
+    try:
+        remotive_jobs = await asyncio.to_thread(scrape_remotive, seen)
+    except Exception as e:
+        log.error(f"Remotive scrape task failed: {e}")
+        remotive_jobs = []
+        
+    await asyncio.sleep(2)
+    
+    try:
+        jobicy_jobs = await asyncio.to_thread(scrape_jobicy, seen)
+    except Exception as e:
+        log.error(f"Jobicy scrape task failed: {e}")
+        jobicy_jobs = []
+        
+    await asyncio.sleep(2)
+    
+    try:
+        arbeitnow_jobs = await asyncio.to_thread(scrape_arbeitnow, seen)
+    except Exception as e:
+        log.error(f"Arbeitnow scrape task failed: {e}")
+        arbeitnow_jobs = []
+        
+    await asyncio.sleep(2)
+    
+    try:
+        themuse_jobs = await asyncio.to_thread(scrape_themuse, seen)
+    except Exception as e:
+        log.error(f"The Muse scrape task failed: {e}")
+        themuse_jobs = []
+        
     all_jobs = (
-        linkedin_jobs + naukri_jobs + wellfound_jobs + internshala_jobs +
-        indeed_jobs + glassdoor_jobs + cutshort_jobs + infopark_jobs
+        linkedin_jobs + wellfound_jobs + internshala_jobs +
+        glassdoor_jobs + cutshort_jobs + infopark_jobs +
+        remotive_jobs + jobicy_jobs + arbeitnow_jobs + themuse_jobs
     )
     await save_seen_jobs(seen)
     
@@ -1259,7 +1276,7 @@ async def post_init(application):
     # Send startup message
     msg = (
         "🤖 <b>Job Alert Bot is now running!</b>\n\n"
-        "I'll ping you the moment a matching job drops on LinkedIn, Naukri, Wellfound, or Internshala.\n\n"
+        "I'll ping you the moment a matching job drops on LinkedIn, Wellfound, Internshala, Remotive, Jobicy, Arbeitnow, or TheMuse.\n\n"
         "<i>Checking every 10 minutes...</i>"
     )
     await send_telegram_async(application, msg)

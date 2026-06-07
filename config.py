@@ -35,6 +35,7 @@ KEYWORDS = [
     # Backend / DevOps & Integrations
     "PostgreSQL", "Prisma", "MongoDB", "Redis", "BullMQ",
     "Docker", "AWS", "GitHub Actions", "CI/CD",
+    "pgvector", "RAG", "Backend",
 
     # Specific Domain / Practices
     "Multi-Tenant", "SaaS", "Microservices", "OCR", "ZATCA",
@@ -50,14 +51,17 @@ CHECK_INTERVAL_MINUTES = 10       # how often to poll (10 min is safe, don't go 
 SEEN_JOBS_FILE = os.path.join(BASE_DIR, "seen_jobs.json")  # FIXED: use absolute path for seen_jobs.json
 
 
-# ─── Indeed India Scraper settings ──────────────────────────────────────────
-# Indeed RSS queries: list of (keyword, location)
-INDEED_SEARCHES = [
-    ("NestJS", "Kerala"),
-    ("NodeJS", "India"),
-    ("React", "India"),
-    ("TypeScript", "India"),
-]
+# ─── Remotive Scraper settings ────────────────────────────────────────────────
+REMOTIVE_KEYWORDS = ["nestjs", "node.js", "react typescript", "full stack"]
+
+
+# ─── Jobicy Scraper settings ──────────────────────────────────────────────────
+JOBICY_KEYWORDS = ["nodejs", "nestjs", "react", "typescript"]
+
+
+# ─── The Muse Scraper settings ────────────────────────────────────────────────
+THEMUSE_CATEGORIES = ["Software Engineer", "Data Science", "IT"]
+
 
 # ─── Glassdoor Scraper settings ──────────────────────────────────────────────
 # List of keywords to search on Glassdoor India
@@ -79,3 +83,4 @@ CUTSHORT_KEYWORDS = [
 
 # ─── Infopark Scraper settings ────────────────────────────────────────────────
 INFOPARK_SEARCH_URL = "https://infopark.in/companies/job-search"
+
