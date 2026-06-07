@@ -1,6 +1,6 @@
 # ─── scorer.py ────────────────────────────────────────────────────────────────
 # Scores jobs 0–10 based on how well they match Faris's stack and target.
-# Higher weight = rarer skill = bigger score boost when matched.
+import unicodedata  # FIXED: import unicodedata for normalisation
 
 SCORING_PROFILE = {
     # ── Tier 1: Core Specialties & Differentiators (weight 1.8 - 2.0) ──────────
@@ -84,7 +84,7 @@ SENIORITY_SCORES = {
 }
 
 # Score threshold — jobs below this won't be sent
-MIN_SCORE = 3.0
+MIN_SCORE = 2.0
 
 # Score above this gets 🔥 Hot Match label
 HOT_MATCH_THRESHOLD = 7.0
@@ -99,6 +99,24 @@ def score_job(title: str, company: str, location: str, description: str = "") ->
         send: bool
     }
     """
+    # FIXED: Handle None and non-string inputs safely
+    title = str(title) if title is not None else ""
+    company = str(company) if company is not None else ""
+    location = str(location) if location is not None else ""
+    description = str(description) if description is not None else ""
+
+    # FIXED: Normalize unicode strings to NFC
+    title = unicodedata.normalize('NFC', title)
+    company = unicodedata.normalize('NFC', company)
+    location = unicodedata.normalize('NFC', location)
+    description = unicodedata.normalize('NFC', description)
+
+    # FIXED: Limit inputs to reasonable length to avoid memory/performance issues
+    title = title[:1000].strip()
+    company = company[:1000].strip()
+    location = location[:1000].strip()
+    description = description[:10000].strip()
+
     combined = f"{title} {description}".lower()
     location_lower = location.lower()
     title_lower = title.lower()

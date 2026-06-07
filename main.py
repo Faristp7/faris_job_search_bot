@@ -15,6 +15,8 @@ from config import (
 from scorer import score_job, MIN_SCORE
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import html  # FIXED: HTML escaping for Telegram parse mode safety
+import threading  # FIXED: thread safety lock for global state and file accesses
 
 # Setup Logging
 logging.basicConfig(
@@ -25,38 +27,84 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # State Files
-STATS_FILE = "stats.json"
-KEYWORDS_FILE = "keywords.json"
-HISTORY_FILE = "sent_jobs_history.json"
+# FIXED: Resolving absolute paths for deployment readiness
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATS_FILE = os.path.join(BASE_DIR, "stats.json")
+KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.json")
+HISTORY_FILE = os.path.join(BASE_DIR, "sent_jobs_history.json")
+
+# FIXED: Thread-safety locks for shared states
+state_lock = threading.Lock()
 
 ACTIVE_KEYWORDS = []
+
+
+# FIXED: Custom OrderedSet class to maintain insertion order and O(1) lookup
+class OrderedSet:
+    def __init__(self, iterable=None):
+        self._map = {}
+        if iterable:
+            for item in iterable:
+                self._map[item] = True
+
+    def __contains__(self, item):
+        return item in self._map
+
+    def add(self, item):
+        self._map[item] = True
+
+    def remove(self, item):
+        self._map.pop(item, None)
+
+    def discard(self, item):
+        self._map.pop(item, None)
+
+    def __iter__(self):
+        return iter(self._map.keys())
+
+    def __len__(self):
+        return len(self._map)
 
 
 # ─── Dynamic Keywords Handler ──────────────────────────────────────────────────
 
 def init_keywords():
     global ACTIVE_KEYWORDS
-    if os.path.exists(KEYWORDS_FILE):
-        try:
-            with open(KEYWORDS_FILE, "r") as f:
-                ACTIVE_KEYWORDS = json.load(f)
-                log.info(f"Loaded {len(ACTIVE_KEYWORDS)} keywords from {KEYWORDS_FILE}")
-                return
-        except Exception as e:
-            log.error(f"Error loading {KEYWORDS_FILE}: {e}. Initializing from config.")
+    with state_lock:  # FIXED: thread safety lock
+        if os.path.exists(KEYWORDS_FILE):
+            try:
+                with open(KEYWORDS_FILE, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):  # FIXED: handle corrupt file
+                        ACTIVE_KEYWORDS = data
+                        log.info(f"Loaded {len(ACTIVE_KEYWORDS)} keywords from {KEYWORDS_FILE}")
+                        return
+                    else:
+                        log.error(f"Keywords file {KEYWORDS_FILE} is not a list. Initializing from config.")
+            except Exception as e:
+                log.error(f"Error loading {KEYWORDS_FILE}: {e}. Initializing from config.")
             
     # Fallback to config
     from config import KEYWORDS as DEFAULT_KEYWORDS
     ACTIVE_KEYWORDS = list(DEFAULT_KEYWORDS)
-    save_keywords()
-    log.info(f"Initialized {KEYWORDS_FILE} with default keywords.")
-
-def save_keywords():
+    # Synchronous save during initialization
     try:
         with open(KEYWORDS_FILE, "w") as f:
             json.dump(ACTIVE_KEYWORDS, f, indent=2)
     except Exception as e:
         log.error(f"Error saving keywords: {e}")
+    log.info(f"Initialized {KEYWORDS_FILE} with default keywords.")
+
+def _save_keywords_sync():
+    with state_lock:  # FIXED: thread safety lock
+        try:
+            with open(KEYWORDS_FILE, "w") as f:
+                json.dump(ACTIVE_KEYWORDS, f, indent=2)
+        except Exception as e:
+            log.error(f"Error saving keywords: {e}")
+
+async def save_keywords():
+    await asyncio.to_thread(_save_keywords_sync)  # FIXED: async safety (non-blocking)
 
 
 # ─── Stats and Settings Persistence ──────────────────────────────────────────
@@ -65,7 +113,7 @@ def get_ist_time():
     # IST is UTC + 5:30
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
-def load_stats():
+def _load_stats_sync():
     now_ist = get_ist_time()
     current_date = now_ist.strftime("%Y-%m-%d")
     
@@ -84,91 +132,120 @@ def load_stats():
         "total_skipped_by_salary": 0
     }
     
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, "r") as f:
-                stats = json.load(f)
-                
-                # Check for missing keys
-                updated = False
-                for k, v in default_stats.items():
-                    if k not in stats:
-                        stats[k] = v
-                        updated = True
-                
-                # Check if calendar day has changed to reset daily counters
-                if stats["date"] != current_date:
-                    stats["date"] = current_date
-                    stats["total_jobs_found_today"] = 0
-                    stats["total_sent_today"] = 0
-                    stats["total_skipped_by_score_today"] = 0
-                    stats["total_skipped_by_salary_today"] = 0
-                    updated = True
+    with state_lock:  # FIXED: thread safety
+        if os.path.exists(STATS_FILE):
+            try:
+                with open(STATS_FILE, "r") as f:
+                    stats = json.load(f)
+                    if not isinstance(stats, dict):  # FIXED: handle corrupt file
+                        log.error(f"Stats file {STATS_FILE} is corrupted. Resetting stats.")
+                        stats = default_stats.copy()
                     
-                if updated:
-                    save_stats(stats)
-                return stats
-        except Exception as e:
-            log.error(f"Error reading {STATS_FILE}: {e}")
-            
-    return default_stats
+                    # Check for missing keys
+                    updated = False
+                    for k, v in default_stats.items():
+                        if k not in stats:
+                            stats[k] = v
+                            updated = True
+                    
+                    # Check if calendar day has changed to reset daily counters
+                    if stats.get("date") != current_date:
+                        stats["date"] = current_date
+                        stats["total_jobs_found_today"] = 0
+                        stats["total_sent_today"] = 0
+                        stats["total_skipped_by_score_today"] = 0
+                        stats["total_skipped_by_salary_today"] = 0
+                        updated = True
+                        
+                    if updated:
+                        try:
+                            with open(STATS_FILE, "w") as sf:
+                                json.dump(stats, sf, indent=2)
+                        except Exception as se:
+                            log.error(f"Error writing to {STATS_FILE}: {se}")
+                    return stats
+            except Exception as e:
+                log.error(f"Error reading {STATS_FILE}: {e}")
+                
+    return default_stats.copy()
 
-def save_stats(stats):
-    try:
-        with open(STATS_FILE, "w") as f:
-            json.dump(stats, f, indent=2)
-    except Exception as e:
-        log.error(f"Error writing to {STATS_FILE}: {e}")
+async def load_stats():
+    return await asyncio.to_thread(_load_stats_sync)  # FIXED: async safety (non-blocking)
+
+def _save_stats_sync(stats):
+    with state_lock:  # FIXED: thread safety
+        try:
+            with open(STATS_FILE, "w") as f:
+                json.dump(stats, f, indent=2)
+        except Exception as e:
+            log.error(f"Error writing to {STATS_FILE}: {e}")
+
+async def save_stats(stats):
+    await asyncio.to_thread(_save_stats_sync, stats)  # FIXED: async safety (non-blocking)
 
 
 # ─── Job History for Daily Summary ─────────────────────────────────────────────
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            log.error(f"Error loading history file: {e}")
+def _load_history_sync():
+    with state_lock:  # FIXED: thread safety
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):  # FIXED: handle corrupt file
+                        return data
+                    else:
+                        log.error(f"History file {HISTORY_FILE} is not a list. Returning empty.")
+            except Exception as e:
+                log.error(f"Error loading history file: {e}")
     return []
 
-def add_to_history(job, score):
-    history = load_history()
+async def load_history():
+    return await asyncio.to_thread(_load_history_sync)  # FIXED: async safety (non-blocking)
+
+def _add_to_history_sync(job, score):
+    history = _load_history_sync()
     now_ts = time.time()
     
+    # FIXED: Handled missing keys in job dictionary
     entry = {
         "timestamp": now_ts,
-        "title": job["title"],
-        "company": job["company"],
-        "location": job["location"],
-        "link": job["link"],
+        "title": job.get("title", "N/A"),
+        "company": job.get("company", "N/A"),
+        "location": job.get("location", "N/A"),
+        "link": job.get("link", ""),
         "score": score
     }
     history.append(entry)
     
     # Prune history older than 48 hours to keep file size small
     cutoff = now_ts - (48 * 3600)
-    history = [item for item in history if item["timestamp"] >= cutoff]
+    history = [item for item in history if item.get("timestamp", 0) >= cutoff]
     
-    try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f, indent=2)
-    except Exception as e:
-        log.error(f"Error saving history file: {e}")
+    with state_lock:  # FIXED: thread safety
+        try:
+            with open(HISTORY_FILE, "w") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            log.error(f"Error saving history file: {e}")
 
-def get_top_jobs_last_24_hours():
-    history = load_history()
+async def add_to_history(job, score):
+    await asyncio.to_thread(_add_to_history_sync, job, score)  # FIXED: async safety (non-blocking)
+
+async def get_top_jobs_last_24_hours():
+    history = await load_history()  # FIXED: async safety (non-blocking)
     now_ts = time.time()
     cutoff = now_ts - (24 * 3600)
     
-    recent_jobs = [item for item in history if item["timestamp"] >= cutoff]
+    recent_jobs = [item for item in history if item.get("timestamp", 0) >= cutoff]
     
     # Deduplicate by link
     seen_links = set()
     unique_recent_jobs = []
     for item in recent_jobs:
-        if item["link"] not in seen_links:
-            seen_links.add(item["link"])
+        link = item.get("link")
+        if link and link not in seen_links:
+            seen_links.add(link)
             unique_recent_jobs.append(item)
             
     # Sort by score descending
@@ -179,7 +256,7 @@ def get_top_jobs_last_24_hours():
 # ─── Salary Parsing Filter ────────────────────────────────────────────────────
 
 def parse_salary_lpa(salary_str: str) -> float | None:
-    if not salary_str:
+    if not salary_str or not isinstance(salary_str, str):  # FIXED: handle None or non-string inputs
         return None
     s = salary_str.lower().replace(",", "")
     
@@ -211,40 +288,92 @@ def parse_salary_lpa(salary_str: str) -> float | None:
 
 # ─── Seen Jobs Tracker ────────────────────────────────────────────────────────
 
-def load_seen_jobs():
-    if os.path.exists(SEEN_JOBS_FILE):
-        try:
-            with open(SEEN_JOBS_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception as e:
-            log.error(f"Error loading seen jobs: {e}")
-    return set()
 
-def save_seen_jobs(seen):
+def _load_seen_jobs_sync() -> OrderedSet:
+    with state_lock:  # FIXED: thread safety
+        if os.path.exists(SEEN_JOBS_FILE):
+            try:
+                with open(SEEN_JOBS_FILE, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):  # FIXED: handle corrupt file
+                        return OrderedSet(data)
+                    else:
+                        log.error(f"Seen jobs file {SEEN_JOBS_FILE} is not a list. Resetting seen list.")
+            except Exception as e:
+                log.error(f"Error loading seen jobs: {e}")
+    return OrderedSet()
+
+async def load_seen_jobs() -> OrderedSet:
+    return await asyncio.to_thread(_load_seen_jobs_sync)  # FIXED: async safety (non-blocking)
+
+def _save_seen_jobs_sync(seen):
     try:
-        with open(SEEN_JOBS_FILE, "w") as f:
-            json.dump(list(seen), f)
+        seen_list = list(seen)
+        # FIXED: cap seen list to 5000 entries (remove oldest 1000 when limit hit)
+        if len(seen_list) > 5000:
+            seen_list = seen_list[1000:]
+            log.info(f"Capped seen jobs list to {len(seen_list)} items (removed oldest 1000).")
+        with state_lock:  # FIXED: thread safety
+            with open(SEEN_JOBS_FILE, "w") as f:
+                json.dump(seen_list, f)
     except Exception as e:
         log.error(f"Error saving seen jobs: {e}")
+
+async def save_seen_jobs(seen):
+    await asyncio.to_thread(_save_seen_jobs_sync, seen)  # FIXED: async safety (non-blocking)
 
 
 # ─── Async Telegram Helper ─────────────────────────────────────────────────────
 
+def split_message_by_lines(text: str, limit: int = 4000) -> list[str]:
+    # FIXED: Split message by lines to ensure HTML safety and avoid Telegram's 4096 character limit
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    for line in text.split("\n"):
+        if current_length + len(line) + 1 > limit:
+            if current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = [line]
+                current_length = len(line) + 1
+            else:
+                chunks.append(line)
+        else:
+            current_chunk.append(line)
+            current_length += len(line) + 1
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+    return chunks
+
 async def send_telegram_async(application, message: str):
-    try:
-        await application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+    chunks = split_message_by_lines(message)  # FIXED: handle character limit safety
+    for i, chunk in enumerate(chunks):
+        if i > 0:
+            await asyncio.sleep(1)  # FIXED: rate limit safety between consecutive sends
+        try:
+            await application.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            log.error(f"Telegram send failed: {e}")
 
 
 # ─── Message Formatting ────────────────────────────────────────────────────────
 
-def format_job_message(title, company, location, link, source, score_data: dict, salary: str = None):
+def format_job_message(title, company, location, link, source, score_data: dict, salary: str | None = None):
+    # FIXED: HTML escaping for dynamic inputs to prevent XML parsing failures
+    title_esc = html.escape(str(title), quote=False) if title else "N/A"
+    company_esc = html.escape(str(company), quote=False) if company else "N/A"
+    location_esc = html.escape(str(location), quote=False) if location else "N/A"
+    salary_esc = html.escape(str(salary), quote=False) if salary else ""
+    link_esc = html.escape(str(link)) if link else ""
+    source_esc = html.escape(str(source), quote=False) if source else "N/A"
+
     source_emoji = {
         "LinkedIn": "💼",
         "Naukri": "🟠",
@@ -254,11 +383,15 @@ def format_job_message(title, company, location, link, source, score_data: dict,
         "Glassdoor": "🟢",
         "Cutshort": "✂️",
         "Infopark": "🏢"
-    }.get(source, "📌")
+    }.get(source_esc, "📌")
 
-    score = score_data["score"]
-    label = score_data["label"]
-    matched = score_data["matched_keywords"]
+    # FIXED: protection against None score_data
+    if not score_data or not isinstance(score_data, dict):
+        score_data = {"score": 0.0, "label": "❌ Weak Match", "matched_keywords": []}
+
+    score = score_data.get("score", 0.0)
+    label = score_data.get("label", "❌ Weak Match")
+    matched = score_data.get("matched_keywords", [])
 
     # Score bar (visual 10-block bar)
     filled = round(score)
@@ -266,22 +399,23 @@ def format_job_message(title, company, location, link, source, score_data: dict,
 
     keywords_line = ""
     if matched:
-        keywords_line = f"🔑 <code>{', '.join(matched)}</code>\n"
+        matched_esc = [html.escape(str(kw), quote=False) for kw in matched]
+        keywords_line = f"🔑 <code>{', '.join(matched_esc)}</code>\n"
 
     salary_line = ""
-    if salary:
-        salary_line = f"💰 <b>Salary:</b> {salary}\n"
+    if salary_esc:
+        salary_line = f"💰 <b>Salary:</b> {salary_esc}\n"
 
     return (
-        f"{source_emoji} <b>New Job Alert — {source}</b>\n\n"
-        f"🏷 <b>{title}</b>\n"
-        f"🏢 {company}\n"
-        f"📍 {location}\n"
+        f"{source_emoji} <b>New Job Alert — {source_esc}</b>\n\n"
+        f"🏷 <b>{title_esc}</b>\n"
+        f"🏢 {company_esc}\n"
+        f"📍 {location_esc}\n"
         f"{salary_line}\n"
         f"{label}\n"
         f"⭐ <b>{score}/10</b>  <code>{bar}</code>\n"
         f"{keywords_line}\n"
-        f"🔗 <a href='{link}'>Apply Now</a>\n"
+        f"🔗 <a href='{link_esc}'>Apply Now</a>\n"
         f"⏰ {get_ist_time().strftime('%d %b %Y, %I:%M %p')}"
     )
 
@@ -289,8 +423,12 @@ def format_job_message(title, company, location, link, source, score_data: dict,
 # ─── Keyword Filter ───────────────────────────────────────────────────────────
 
 def matches_keywords(text: str) -> bool:
+    if not text:
+        return False
     text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in ACTIVE_KEYWORDS)
+    with state_lock:  # FIXED: thread safety lock for global active keywords
+        kws = list(ACTIVE_KEYWORDS)
+    return any(kw.lower() in text_lower for kw in kws)
 
 
 # ─── Scrapers (LinkedIn, Naukri, Wellfound, Internshala) ──────────────────────
@@ -301,9 +439,9 @@ LINKEDIN_RSS_URLS = [
     "https://www.linkedin.com/jobs/search/?keywords=full+stack+developer+NestJS&location=India&f_WT=2&f_TPR=r3600&start=0",
 ]
 
-def scrape_linkedin(seen: set) -> list:
+def scrape_linkedin(seen) -> list:
     found = []
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/120.0.0.0"}
 
     for url in LINKEDIN_RSS_URLS:
         try:
@@ -313,6 +451,8 @@ def scrape_linkedin(seen: set) -> list:
                 continue
             soup = BeautifulSoup(r.text, "html.parser")
             cards = soup.select("div.base-card")
+            if not cards:  # FIXED: handle empty response
+                continue
 
             for card in cards[:15]:
                 try:
@@ -321,10 +461,19 @@ def scrape_linkedin(seen: set) -> list:
                     location_el = card.select_one("span.job-search-card__location")
                     link_el = card.select_one("a.base-card__full-link")
 
-                    title = title_el.text.strip() if title_el else "N/A"
-                    company = company_el.text.strip() if company_el else "N/A"
-                    location = location_el.text.strip() if location_el else "N/A"
-                    link = link_el["href"].split("?")[0] if link_el else ""
+                    title = title_el.get_text(strip=True) if title_el else "N/A"  # FIXED: use get_text and check safely
+                    company = company_el.get_text(strip=True) if company_el else "N/A"  # FIXED: use get_text and check safely
+                    location = location_el.get_text(strip=True) if location_el else "N/A"  # FIXED: use get_text and check safely
+                    
+                    # FIXED: safe href check
+                    link = ""
+                    if link_el:
+                        href = link_el.get("href")
+                        if href:
+                            link = href.split("?")[0]
+
+                    if not link or title == "N/A":
+                        continue
 
                     job_id = f"linkedin_{link}"
                     if job_id in seen:
@@ -354,7 +503,7 @@ NAUKRI_SEARCHES = [
     ("NestJS Node.js", "India"),
 ]
 
-def scrape_naukri(seen: set) -> list:
+def scrape_naukri(seen: OrderedSet) -> list:
     found = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -378,43 +527,55 @@ def scrape_naukri(seen: set) -> list:
                 continue
             r.raise_for_status()
             data = r.json()
+            
+            # FIXED: json and list type safety
+            if not isinstance(data, dict):
+                continue
             jobs = data.get("jobDetails", [])
+            if not isinstance(jobs, list):
+                continue
 
             for job in jobs:
-                title = job.get("title", "N/A")
-                company = job.get("companyName", "N/A")
-                
-                # Robust placeholder parsing
-                placeholders = job.get("placeholders", [])
-                location_str = "India"
-                salary_str = None
-                
-                for p in placeholders:
-                    ptype = p.get("type")
-                    plabel = p.get("label")
-                    if ptype == "location" and plabel:
-                        location_str = ", ".join(plabel.split(",")[:2])
-                    elif ptype == "salary" and plabel:
-                        salary_str = plabel
-                
-                # Fallback for location (original logic fallback)
-                if location_str == "India" and placeholders:
-                    location_str = ", ".join(placeholders[0].get("label", "").split(",")[:2])
-                
-                link = job.get("jdURL", "https://www.naukri.com")
-                job_id = f"naukri_{job.get('jobId', link)}"
+                try:  # FIXED: wrap inner loop in exception block
+                    if not isinstance(job, dict):
+                        continue
+                    title = job.get("title", "N/A")
+                    company = job.get("companyName", "N/A")
+                    placeholders = job.get("placeholders", [])
+                    if not isinstance(placeholders, list):
+                        placeholders = []
+                    location_str = "India"
+                    salary_str = None
+                    for p in placeholders:
+                        if not isinstance(p, dict):
+                            continue
+                        ptype = p.get("type")
+                        plabel = p.get("label")
+                        if ptype == "location" and plabel:
+                            location_str = ", ".join(str(plabel).split(",")[:2])
+                        elif ptype == "salary" and plabel:
+                            salary_str = str(plabel)
+                    
+                    # Fallback for location (original logic fallback)
+                    if location_str == "India" and placeholders:
+                        location_str = ", ".join(placeholders[0].get("label", "").split(",")[:2])
+                    
+                    link = job.get("jdURL", "https://www.naukri.com")
+                    job_id = f"naukri_{job.get('jobId', link)}"
 
-                if job_id in seen:
-                    continue
-                if not matches_keywords(title):
-                    continue
+                    if job_id in seen:
+                        continue
+                    if not matches_keywords(title):
+                        continue
 
-                seen.add(job_id)
-                found.append({
-                    "title": title, "company": company,
-                    "location": location_str, "link": link, "source": "Naukri",
-                    "salary": salary_str
-                })
+                    seen.add(job_id)
+                    found.append({
+                        "title": title, "company": company,
+                        "location": location_str, "link": link, "source": "Naukri",
+                        "salary": salary_str
+                    })
+                except Exception as e:
+                    log.warning(f"Error parsing Naukri job: {e}")
 
         except Exception as e:
             log.warning(f"Naukri scrape error ({keyword}): {e}")
@@ -428,7 +589,7 @@ WELLFOUND_SEARCHES = [
     "full-stack",
 ]
 
-def scrape_wellfound(seen: set) -> list:
+def scrape_wellfound(seen: OrderedSet) -> list:
     found = []
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -485,7 +646,7 @@ INTERNSHALA_SEARCHES = [
     "full-stack-development",
 ]
 
-def scrape_internshala(seen: set) -> list:
+def scrape_internshala(seen: OrderedSet) -> list:
     found = []
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
@@ -533,9 +694,8 @@ def scrape_internshala(seen: set) -> list:
     return found
 
 
-def scrape_indeed(seen: set) -> list:
+def scrape_indeed(seen: OrderedSet) -> list:
     found = []
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
     for keyword, location_query in INDEED_SEARCHES:
         try:
@@ -543,10 +703,12 @@ def scrape_indeed(seen: set) -> list:
             loc_encoded = location_query.replace(" ", "%20")
             url = f"https://in.indeed.com/rss?q={kw_encoded}&l={loc_encoded}&sort=date"
             
-            r = requests.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
+            feedparser.USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            feed = feedparser.parse(url)
             
-            feed = feedparser.parse(r.text)
+            if feed.bozo and not feed.entries:
+                log.warning(f"Indeed RSS parse failed for {keyword} in {location_query}")
+                continue
             
             for entry in feed.entries:
                 title_raw = entry.get("title")
@@ -560,7 +722,7 @@ def scrape_indeed(seen: set) -> list:
                     title = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
                 else:
                     title = str(title_raw) if title_raw is not None else "N/A"
-                title = title.strip()
+                title = str(title).strip()
                 
                 # Normalize company
                 if isinstance(author_raw, list) and author_raw:
@@ -568,7 +730,7 @@ def scrape_indeed(seen: set) -> list:
                     company = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
                 else:
                     company = str(author_raw) if author_raw is not None else "Indeed"
-                company = company.strip()
+                company = str(company).strip()
                 
                 # Normalize location
                 if isinstance(location_raw, list) and location_raw:
@@ -576,7 +738,7 @@ def scrape_indeed(seen: set) -> list:
                     location = first.get("value") or first.get("content") or str(first) if isinstance(first, dict) else str(first)
                 else:
                     location = str(location_raw) if location_raw is not None else location_query
-                location = location.strip()
+                location = str(location).strip()
                 
                 # Normalize link
                 if isinstance(link_raw, list) and link_raw:
@@ -621,15 +783,12 @@ def scrape_indeed(seen: set) -> list:
                     "salary": None
                 })
         except Exception as e:
-            if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 403:
-                log.warning("Indeed scrape blocked by Cloudflare (403 Forbidden).")
-            else:
-                log.warning(f"Indeed scrape error for {keyword} in {location_query}: {e}")
+            log.warning(f"Indeed scrape error for {keyword} in {location_query}: {e}")
             
     return found
 
 
-def scrape_glassdoor(seen: set) -> list:
+def scrape_glassdoor(seen: OrderedSet) -> list:
     found = []
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     
@@ -701,50 +860,68 @@ def scrape_glassdoor(seen: set) -> list:
     return found
 
 
-def scrape_cutshort(seen: set) -> list:
+def scrape_cutshort(seen: OrderedSet) -> list:
     log.warning("Cutshort API scraper is deprecated (endpoint returned 404/Not Found). Skipping Cutshort.")
     return []
 
 
-def scrape_infopark(seen: set) -> list:
+def scrape_infopark(seen: OrderedSet) -> list:
     found = []
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     
     try:
         url = INFOPARK_SEARCH_URL
+        
+        # Try GET first
+        method_used = "GET"
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
         
         soup = BeautifulSoup(r.text, "html.parser")
         rows = soup.find_all("tr")
+        job_rows = [row for row in rows if len(row.find_all("td")) >= 4]
         
-        for row in rows:
+        if not job_rows:
+            # Retry with POST request
+            method_used = "POST"
+            post_headers = headers.copy()
+            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = {"keyword": "developer"}
+            r = requests.post(url, headers=post_headers, data=data, timeout=15)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            rows = soup.find_all("tr")
+            job_rows = [row for row in rows if len(row.find_all("td")) >= 4]
+            
+        log.info(f"Infopark scrape succeeded using {method_used} method.")
+        
+        for row in job_rows:
             tds = row.find_all("td")
-            if len(tds) >= 4:
-                title = tds[1].text.strip()
-                company = tds[2].text.strip()
-                location = "Infopark, Kochi, Kerala"
+            title = tds[1].text.strip()
+            company = tds[2].text.strip()
+            location = "Infopark, Kochi, Kerala"
+            
+            link_a = tds[4].find("a", href=True) if len(tds) > 4 else row.find("a", href=True)
+            link = link_a["href"].strip() if link_a else ""
+            if link and not link.startswith("http"):
+                link = f"https://infopark.in{link}"
                 
-                link_a = tds[4].find("a", href=True) if len(tds) > 4 else row.find("a", href=True)
-                link = link_a["href"].strip() if link_a else ""
-                if link and not link.startswith("http"):
-                    link = f"https://infopark.in{link}"
-                    
-                if not title or not company or not link:
-                    continue
-                    
-                job_id = f"infopark_{link}"
-                if job_id in seen:
-                    continue
-                if not matches_keywords(title):
-                    continue
-                    
-                seen.add(job_id)
-                found.append({
-                    "title": title, "company": company,
-                    "location": location, "link": link, "source": "Infopark",
-                    "salary": None
-                })
+            if not title or not company or not link:
+                continue
+                
+            job_id = f"infopark_{link}"
+            if job_id in seen:
+                continue
+            if not matches_keywords(title):
+                continue
+                
+            seen.add(job_id)
+            found.append({
+                "title": title, "company": company,
+                "location": location, "link": link, "source": "Infopark",
+                "salary": None
+            })
     except Exception as e:
         log.warning(f"Infopark scrape error: {e}")
         
@@ -755,7 +932,7 @@ def scrape_infopark(seen: set) -> list:
 
 async def run_scraper_async(application):
     log.info("🔍 Running job scraper...")
-    seen = load_seen_jobs()
+    seen = await load_seen_jobs()
     
     # Run sync scrapers in thread pool executor
     try:
@@ -824,10 +1001,10 @@ async def run_scraper_async(application):
         linkedin_jobs + naukri_jobs + wellfound_jobs + internshala_jobs +
         indeed_jobs + glassdoor_jobs + cutshort_jobs + infopark_jobs
     )
-    save_seen_jobs(seen)
+    await save_seen_jobs(seen)
     
     # Reload stats to update
-    stats = load_stats()
+    stats = await load_stats()
     stats["total_jobs_found_today"] += len(all_jobs)
     
     # Score and filter
@@ -876,7 +1053,7 @@ async def run_scraper_async(application):
                 job.get("salary")
             )
             await send_telegram_async(application, msg)
-            add_to_history(job, score_data["score"])
+            await add_to_history(job, score_data["score"])
             sent_count += 1
             await asyncio.sleep(1)  # rate limit safety
     elif all_jobs:
@@ -888,14 +1065,14 @@ async def run_scraper_async(application):
     stats["total_sent"] += sent_count
     stats["last_run_timestamp"] = get_ist_time().strftime("%Y-%m-%d %I:%M:%S %p")
     stats["last_run_epoch"] = time.time()
-    save_stats(stats)
+    await save_stats(stats)
 
 
 # ─── Daily 9am Summary ────────────────────────────────────────────────────────
 
 async def send_daily_summary_async(application):
     log.info("Compiling daily 9:00 AM IST summary...")
-    top_jobs = get_top_jobs_last_24_hours()
+    top_jobs = await get_top_jobs_last_24_hours()
     
     if not top_jobs:
         msg = "📅 <b>Daily Job Summary (Last 24 Hours)</b>\n\nNo matching jobs were found in the last 24 hours."
@@ -926,23 +1103,23 @@ async def send_daily_summary_async(application):
 # ─── Command Handlers ──────────────────────────────────────────────────────────
 
 async def pause_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = load_stats()
+    stats = await load_stats()
     stats["is_paused"] = True
-    save_stats(stats)
+    await save_stats(stats)
     log.info("Scraper paused by user command.")
     if update.effective_message:
         await update.effective_message.reply_text("⏸️ <b>Scraper loop paused.</b>", parse_mode="HTML")
 
 async def resume_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = load_stats()
+    stats = await load_stats()
     stats["is_paused"] = False
-    save_stats(stats)
+    await save_stats(stats)
     log.info("Scraper resumed by user command.")
     if update.effective_message:
         await update.effective_message.reply_text("▶️ <b>Scraper loop resumed.</b>", parse_mode="HTML")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stats = load_stats()
+    stats = await load_stats()
     is_paused = stats.get("is_paused", False)
     status_str = "Paused ⏸️" if is_paused else "Running ▶️"
     
@@ -982,7 +1159,7 @@ async def addkeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     ACTIVE_KEYWORDS.append(word)
-    save_keywords()
+    await save_keywords()
     log.info(f"Added keyword: {word}")
     await update.effective_message.reply_text(f"✅ Added keyword: <code>{word}</code>", parse_mode="HTML")
 
@@ -1009,7 +1186,7 @@ async def removekeyword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     for k in matching_kws:
         ACTIVE_KEYWORDS.remove(k)
-    save_keywords()
+    await save_keywords()
     log.info(f"Removed keyword(s): {matching_kws}")
     await update.effective_message.reply_text(f"❌ Removed keyword: <code>{word}</code>", parse_mode="HTML")
 
@@ -1031,7 +1208,7 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def scraper_loop(application):
     log.info("Scraper loop started.")
     # Immediate initial run if not paused
-    stats = load_stats()
+    stats = await load_stats()
     if not stats.get("is_paused", False):
         try:
             await run_scraper_async(application)
@@ -1041,7 +1218,7 @@ async def scraper_loop(application):
     while True:
         try:
             await asyncio.sleep(10)
-            stats = load_stats()
+            stats = await load_stats()
             if stats.get("is_paused", False):
                 continue
                 
@@ -1061,11 +1238,11 @@ async def daily_summary_loop(application):
             
             # Check if it is 9:00 AM IST (hour 9, minute 0)
             if now_ist.hour == 9 and now_ist.minute == 0:
-                stats = load_stats()
+                stats = await load_stats()
                 if stats.get("last_summary_date") != current_date_str:
                     await send_daily_summary_async(application)
                     stats["last_summary_date"] = current_date_str
-                    save_stats(stats)
+                    await save_stats(stats)
         except Exception as e:
             log.error(f"Error in daily summary loop task: {e}")
             
@@ -1093,7 +1270,7 @@ async def post_init(application):
 
 if __name__ == "__main__":
     init_keywords()
-    load_stats()
+    _load_stats_sync()
     
     # Build Telegram Bot application
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
