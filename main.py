@@ -303,11 +303,14 @@ LINKEDIN_RSS_URLS = [
 
 def scrape_linkedin(seen: set) -> list:
     found = []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; JobBot/1.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
     for url in LINKEDIN_RSS_URLS:
         try:
             r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                log.warning(f"LinkedIn scrape returned status code {r.status_code}")
+                continue
             soup = BeautifulSoup(r.text, "html.parser")
             cards = soup.select("div.base-card")
 
@@ -370,6 +373,10 @@ def scrape_naukri(seen: set) -> list:
                 f"&keyword={kw_encoded}&location={loc_encoded}&pageNo=1"
             )
             r = requests.get(api_url, headers=headers, timeout=15)
+            if r.status_code == 406 and "recaptcha" in r.text.lower():
+                log.warning("Naukri scrape blocked: ReCAPTCHA challenge required.")
+                continue
+            r.raise_for_status()
             data = r.json()
             jobs = data.get("jobDetails", [])
 
@@ -424,14 +431,18 @@ WELLFOUND_SEARCHES = [
 def scrape_wellfound(seen: set) -> list:
     found = []
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     }
 
     for role in WELLFOUND_SEARCHES:
         try:
             url = f"https://wellfound.com/role/r/{role}"
             r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code == 403 or "captcha-delivery" in r.text:
+                log.warning(f"Wellfound scrape blocked by Captcha/Anti-bot (status {r.status_code}).")
+                continue
+            r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
 
             listings = soup.select("div[class*='JobListing']") or soup.select("div[data-test='StartupResult']")
@@ -476,12 +487,15 @@ INTERNSHALA_SEARCHES = [
 
 def scrape_internshala(seen: set) -> list:
     found = []
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
     for category in INTERNSHALA_SEARCHES:
         try:
             url = f"https://internshala.com/jobs/{category}-jobs"
             r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                log.warning(f"Internshala scrape returned status code {r.status_code}")
+                continue
             soup = BeautifulSoup(r.text, "html.parser")
 
             cards = soup.select("div.individual_internship")
@@ -607,7 +621,10 @@ def scrape_indeed(seen: set) -> list:
                     "salary": None
                 })
         except Exception as e:
-            log.warning(f"Indeed scrape error for {keyword} in {location_query}: {e}")
+            if isinstance(e, requests.HTTPError) and e.response is not None and e.response.status_code == 403:
+                log.warning("Indeed scrape blocked by Cloudflare (403 Forbidden).")
+            else:
+                log.warning(f"Indeed scrape error for {keyword} in {location_query}: {e}")
             
     return found
 
@@ -685,44 +702,8 @@ def scrape_glassdoor(seen: set) -> list:
 
 
 def scrape_cutshort(seen: set) -> list:
-    found = []
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    
-    for keyword in CUTSHORT_KEYWORDS:
-        try:
-            kw_encoded = keyword.replace(" ", "%20")
-            url = f"https://cutshort.io/api/v1/jobs?query={kw_encoded}&location=Kerala"
-            r = requests.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            jobs = r.json()
-            
-            job_list = jobs if isinstance(jobs, list) else jobs.get("jobs", [])
-            for job in job_list:
-                title = job.get("title", "N/A")
-                company_obj = job.get("company", {})
-                company = company_obj.get("name", "N/A") if isinstance(company_obj, dict) else "N/A"
-                location = job.get("location", "Kerala")
-                link = job.get("applyUrl") or job.get("shortUrl") or "https://cutshort.io"
-                
-                if not title or title == "N/A" or not link:
-                    continue
-                    
-                job_id = f"cutshort_{link}"
-                if job_id in seen:
-                    continue
-                if not matches_keywords(title):
-                    continue
-                    
-                seen.add(job_id)
-                found.append({
-                    "title": title, "company": company,
-                    "location": location, "link": link, "source": "Cutshort",
-                    "salary": None
-                })
-        except Exception as e:
-            log.warning(f"Cutshort scrape error for keyword {keyword}: {e}")
-            
-    return found
+    log.warning("Cutshort API scraper is deprecated (endpoint returned 404/Not Found). Skipping Cutshort.")
+    return []
 
 
 def scrape_infopark(seen: set) -> list:
