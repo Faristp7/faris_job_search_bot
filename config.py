@@ -42,3 +42,34 @@ KEYWORDS = [
 # ─── Scraper settings ─────────────────────────────────────────────────────────
 CHECK_INTERVAL_MINUTES = 10       # how often to poll (10 min is safe, don't go lower)
 SEEN_JOBS_FILE = "seen_jobs.json" # tracks already-notified jobs
+
+
+# ─── Indeed India Scraper settings ──────────────────────────────────────────
+# Indeed RSS queries: list of (keyword, location)
+INDEED_SEARCHES = [
+    ("NestJS", "Kerala"),
+    ("NodeJS", "India"),
+    ("React", "India"),
+    ("TypeScript", "India"),
+]
+
+# ─── Glassdoor Scraper settings ──────────────────────────────────────────────
+# List of keywords to search on Glassdoor India
+GLASSDOOR_KEYWORDS = [
+    "nestjs",
+    "nodejs",
+    "react",
+    "typescript",
+]
+
+# ─── Cutshort Scraper settings ────────────────────────────────────────────────
+# List of keywords to search on Cutshort
+CUTSHORT_KEYWORDS = [
+    "nestjs",
+    "nodejs",
+    "react",
+    "typescript",
+]
+
+# ─── Infopark Scraper settings ────────────────────────────────────────────────
+INFOPARK_SEARCH_URL = "https://infopark.in/companies/job-search"
