@@ -159,7 +159,8 @@ def score_job(title: str, company: str, location: str, description: str = "") ->
 
     return {
         "score": score,
-        "matched_keywords": matched[:6],  # top 6 to keep message clean
+        "matched_keywords": matched,  # return all matched keywords
         "label": label,
         "send": score >= MIN_SCORE
     }
+

@@ -14,6 +14,7 @@ from config import (
     REMOTIVE_KEYWORDS, JOBICY_KEYWORDS, THEMUSE_CATEGORIES
 )
 from scorer import score_job, MIN_SCORE
+from gemini_service import evaluate_job_fit, parse_search_query, scrape_indeed_jobs_via_gemini
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import html  # FIXED: HTML escaping for Telegram parse mode safety
@@ -403,11 +404,34 @@ def format_job_message(title, company, location, link, source, score_data: dict,
     keywords_line = ""
     if matched:
         matched_esc = [html.escape(str(kw), quote=False) for kw in matched]
-        keywords_line = f"🔑 <code>{', '.join(matched_esc)}</code>\n"
+        # Keep top 6 in message body to keep it clean, but show total count
+        display_matched = matched_esc[:6]
+        keywords_line = f"🔑 <b>Keywords ({len(matched)} matched):</b> <code>{', '.join(display_matched)}</code>\n"
 
     salary_line = ""
     if salary_esc:
         salary_line = f"💰 <b>Salary:</b> {salary_esc}\n"
+
+    gemini_line = ""
+    gemini_data = score_data.get("gemini")
+    if gemini_data and isinstance(gemini_data, dict):
+        g_score = gemini_data.get("score", 0.0)
+        g_reason = html.escape(str(gemini_data.get("reason", "No reason provided.")), quote=False)
+        g_tech = gemini_data.get("detected_tech", [])
+        
+        g_filled = round(g_score)
+        g_bar = "█" * g_filled + "░" * (10 - g_filled)
+        
+        g_tech_line = ""
+        if g_tech:
+            g_tech_esc = [html.escape(str(t), quote=False) for t in g_tech]
+            g_tech_line = f"🛠️ <b>AI Stack:</b> <code>{', '.join(g_tech_esc)}</code>\n"
+            
+        gemini_line = (
+            f"🤖 <b>AI Fit Score:</b> <b>{g_score}/10</b>  <code>{g_bar}</code>\n"
+            f"💡 <b>AI Insight:</b> <i>{g_reason}</i>\n"
+            f"{g_tech_line}\n"
+        )
 
     return (
         f"{source_emoji} <b>New Job Alert — {source_esc}</b>\n\n"
@@ -418,6 +442,7 @@ def format_job_message(title, company, location, link, source, score_data: dict,
         f"{label}\n"
         f"⭐ <b>{score}/10</b>  <code>{bar}</code>\n"
         f"{keywords_line}\n"
+        f"{gemini_line}"
         f"🔗 <a href='{link_esc}'>Apply Now</a>\n"
         f"⏰ {get_ist_time().strftime('%d %b %Y, %I:%M %p')}"
     )
@@ -488,7 +513,7 @@ def scrape_linkedin(seen) -> list:
                     found.append({
                         "title": title, "company": company,
                         "location": location, "link": link, "source": "LinkedIn",
-                        "salary": None
+                        "salary": None, "description": ""
                     })
                 except Exception:
                     continue
@@ -536,10 +561,12 @@ def scrape_remotive(seen: OrderedSet) -> list:
                         continue
 
                     seen.add(job_id)
+                    desc_html = job.get("description", "")
+                    desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
                     found.append({
                         "title": title, "company": company,
                         "location": location, "link": link, "source": "Remotive",
-                        "salary": None
+                        "salary": None, "description": desc_clean
                     })
                 except Exception as e:
                     log.warning(f"Error parsing Remotive job: {e}")
@@ -588,10 +615,12 @@ def scrape_jobicy(seen: OrderedSet) -> list:
                         continue
 
                     seen.add(job_id)
+                    desc_html = job.get("jobDescription", job.get("description", ""))
+                    desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
                     found.append({
                         "title": title, "company": company,
                         "location": location, "link": link, "source": "Jobicy",
-                        "salary": None
+                        "salary": None, "description": desc_clean
                     })
                 except Exception as e:
                     log.warning(f"Error parsing Jobicy job: {e}")
@@ -647,10 +676,12 @@ def scrape_arbeitnow(seen: OrderedSet) -> list:
                     continue
 
                 seen.add(job_id)
+                desc_html = job.get("description", "")
+                desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
                 found.append({
                     "title": title, "company": company,
                     "location": location, "link": link, "source": "Arbeitnow",
-                    "salary": None
+                    "salary": None, "description": desc_clean
                 })
             except Exception as e:
                 log.warning(f"Error parsing Arbeitnow job: {e}")
@@ -708,10 +739,12 @@ def scrape_themuse(seen: OrderedSet) -> list:
                         continue
 
                     seen.add(job_id)
+                    desc_html = job.get("contents", "")
+                    desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
                     found.append({
                         "title": title, "company": company,
                         "location": location, "link": link, "source": "TheMuse",
-                        "salary": None
+                        "salary": None, "description": desc_clean
                     })
                 except Exception as e:
                     log.warning(f"Error parsing The Muse job: {e}")
@@ -778,7 +811,7 @@ def scrape_internshala(seen: OrderedSet) -> list:
                     found.append({
                         "title": title, "company": company,
                         "location": location, "link": link, "source": "Internshala",
-                        "salary": None
+                        "salary": None, "description": ""
                     })
                 except Exception:
                     continue
@@ -852,7 +885,7 @@ def scrape_glassdoor(seen: OrderedSet) -> list:
                 found.append({
                     "title": title, "company": company,
                     "location": location, "link": link, "source": "Glassdoor",
-                    "salary": None
+                    "salary": None, "description": ""
                 })
         except Exception as e:
             log.warning(f"Glassdoor scrape error for keyword {keyword}: {e}")
@@ -920,12 +953,124 @@ def scrape_infopark(seen: OrderedSet) -> list:
             found.append({
                 "title": title, "company": company,
                 "location": location, "link": link, "source": "Infopark",
-                "salary": None
+                "salary": None, "description": ""
             })
     except Exception as e:
         log.warning(f"Infopark scrape error: {e}")
         
     return found
+
+
+def _search_remotive_sync(keywords: list[str]) -> list[dict]:
+    found = []
+    seen = set()
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    for kw in keywords:
+        try:
+            kw_encoded = quote(kw)
+            url = f"https://remotive.com/api/remote-jobs?search={kw_encoded}&limit=10"
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                jobs = data.get("jobs", [])
+                for job in jobs[:10]:
+                    title = job.get("title", "N/A")
+                    company = job.get("company_name", "N/A")
+                    location = job.get("candidate_required_location", "Remote")
+                    link = job.get("url", "")
+                    if not link or title == "N/A":
+                        continue
+                    if link not in seen:
+                        seen.add(link)
+                        desc_html = job.get("description", "")
+                        desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
+                        found.append({
+                            "title": title, "company": company, "location": location,
+                            "link": link, "source": "Remotive", "salary": None, "description": desc_clean
+                        })
+        except Exception as e:
+            log.warning(f"Remotive dynamic search error: {e}")
+    return found
+
+def _search_jobicy_sync(keywords: list[str]) -> list[dict]:
+    found = []
+    seen = set()
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    for kw in keywords:
+        try:
+            kw_encoded = quote(kw)
+            url = f"https://jobicy.com/api/v2/remote-jobs?tag={kw_encoded}&count=10"
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                jobs = data.get("jobs", [])
+                for job in jobs[:10]:
+                    title = job.get("jobTitle", "N/A")
+                    company = job.get("companyName", "N/A")
+                    location = job.get("jobGeo", "Remote")
+                    link = job.get("url", "")
+                    if not link or title == "N/A":
+                        continue
+                    if link not in seen:
+                        seen.add(link)
+                        desc_html = job.get("jobDescription", job.get("description", ""))
+                        desc_clean = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ").strip() if desc_html else ""
+                        found.append({
+                            "title": title, "company": company, "location": location,
+                            "link": link, "source": "Jobicy", "salary": None, "description": desc_clean
+                        })
+        except Exception as e:
+            log.warning(f"Jobicy dynamic search error: {e}")
+    return found
+
+async def search_jobs_on_demand(keywords: list[str], location_pref: str = "") -> list[dict]:
+    remotive_task = asyncio.to_thread(_search_remotive_sync, keywords)
+    jobicy_task = asyncio.to_thread(_search_jobicy_sync, keywords)
+    
+    results = await asyncio.gather(remotive_task, jobicy_task, return_exceptions=True)
+    
+    all_found = []
+    seen_links = set()
+    for res in results:
+        if isinstance(res, list):
+            for job in res:
+                link = job.get("link")
+                if link and link not in seen_links:
+                    if location_pref:
+                        loc_lower = job.get("location", "").lower()
+                        if location_pref.lower() not in loc_lower:
+                            continue
+                    seen_links.add(link)
+                    all_found.append(job)
+    return all_found
+
+
+async def scrape_indeed(seen: OrderedSet) -> list:
+    """
+    Scrapes Indeed jobs using Gemini Search Grounding.
+    """
+    try:
+        jobs = await scrape_indeed_jobs_via_gemini()
+        filtered_jobs = []
+        for job in jobs:
+            link = job.get("link", "")
+            if not link:
+                continue
+            job_id = f"indeed_{link}"
+            if job_id in seen:
+                continue
+            
+            title = job.get("title", "")
+            desc = job.get("description", "")
+            if not matches_keywords(title) and not matches_keywords(desc):
+                continue
+                
+            seen.add(job_id)
+            filtered_jobs.append(job)
+        return filtered_jobs
+    except Exception as e:
+        log.warning(f"Indeed scrape error via Gemini: {e}")
+        return []
 
 
 # ─── Async Scraper Runner ───────────────────────────────────────────────────────
@@ -1013,10 +1158,21 @@ async def run_scraper_async(application):
         log.error(f"The Muse scrape task failed: {e}")
         themuse_jobs = []
         
+    await asyncio.sleep(2)
+    
+    try:
+        indeed_jobs = await scrape_indeed(seen)
+    except Exception as e:
+        log.error(f"Indeed scrape task failed: {e}")
+        indeed_jobs = []
+        
+    await asyncio.sleep(2)
+        
     all_jobs = (
         linkedin_jobs + wellfound_jobs + internshala_jobs +
         glassdoor_jobs + cutshort_jobs + infopark_jobs +
-        remotive_jobs + jobicy_jobs + arbeitnow_jobs + themuse_jobs
+        remotive_jobs + jobicy_jobs + arbeitnow_jobs + themuse_jobs +
+        indeed_jobs
     )
     await save_seen_jobs(seen)
     
@@ -1034,7 +1190,7 @@ async def run_scraper_async(application):
         salary_str = job.get("salary")
         if salary_str:
             max_lpa = parse_salary_lpa(salary_str)
-            if max_lpa is not None and max_lpa < 6.0:
+            if max_lpa is not None and max_lpa < 3.0:
                 log.info(f"Skipping job {job['title']} at {job['company']} due to low salary: {salary_str} ({max_lpa} LPA)")
                 skipped_by_salary_count += 1
                 continue
@@ -1044,9 +1200,25 @@ async def run_scraper_async(application):
             title=job["title"],
             company=job["company"],
             location=job["location"],
+            description=job.get("description", "")
         )
         
         if score_data["send"]:
+            # Perform deep AI validation using Gemini
+            gemini_data = await evaluate_job_fit(
+                title=job["title"],
+                company=job["company"],
+                location=job["location"],
+                description=job.get("description", "")
+            )
+            score_data["gemini"] = gemini_data
+            
+            # If Gemini thinks this is a very weak match, filter it out
+            if gemini_data.get("score", 0.0) < 3.0:
+                log.info(f"Skipping job '{job['title']}' at {job['company']} due to low Gemini AI score: {gemini_data.get('score')}/10")
+                skipped_by_score_count += 1
+                continue
+                
             scored_jobs.append((job, score_data))
         else:
             skipped_by_score_count += 1
@@ -1219,6 +1391,82 @@ async def keywords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"🔑 <b>Active Keywords ({len(ACTIVE_KEYWORDS)}):</b>\n\n{kws_list}"
     await update.effective_message.reply_text(msg, parse_mode="HTML")
 
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
+        
+    if not context.args:
+        await update.effective_message.reply_text("⚠️ <b>Usage:</b> /search &lt;natural language query&gt;\n<i>Example: /search remote NestJS jobs with PostgreSQL</i>", parse_mode="HTML")
+        return
+        
+    query = " ".join(context.args).strip()
+    status_msg = await update.effective_message.reply_text("🔍 <i>Analyzing your search query with Gemini...</i>", parse_mode="HTML")
+    
+    parsed = await parse_search_query(query)
+    keywords = parsed.get("keywords", [])
+    location = parsed.get("location", "")
+    
+    if not keywords:
+        await status_msg.edit_text("❌ Gemini was unable to extract search keywords from your query. Please try again with details like title/tech stack.")
+        return
+        
+    keywords_str = ", ".join(f"<code>{k}</code>" for k in keywords)
+    loc_str = f" in <code>{location}</code>" if location else ""
+    await status_msg.edit_text(f"⚡ <b>Gemini Keywords:</b> {keywords_str}{loc_str}\n\n🔍 <i>Scraping matching remote jobs on-demand...</i>", parse_mode="HTML")
+    
+    jobs = await search_jobs_on_demand(keywords, location)
+    if not jobs:
+        await status_msg.edit_text("😴 No matching jobs found from on-demand sources.")
+        return
+        
+    await status_msg.edit_text(f"✅ Found {len(jobs)} candidate jobs.\n🤖 <i>Evaluating compatibility with Gemini AI...</i>", parse_mode="HTML")
+    
+    scored = []
+    # Limit to top 8 candidates to avoid hitting API rate limits during queries
+    for job in jobs[:8]:
+        try:
+            gemini_data = await evaluate_job_fit(
+                title=job["title"],
+                company=job["company"],
+                location=job["location"],
+                description=job.get("description", "")
+            )
+            scored.append((job, gemini_data))
+        except Exception as e:
+            log.error(f"Error evaluating job during on-demand search: {e}")
+            
+    # Sort by Gemini score descending
+    scored.sort(key=lambda x: x[1].get("score", 0.0), reverse=True)
+    
+    # Filter for reasonable fit (score >= 3.0) and take top 5
+    top_results = [s for s in scored if s[1].get("score", 0.0) >= 3.0][:5]
+    
+    if not top_results:
+        await status_msg.edit_text("❌ Evaluated candidate jobs, but none met the minimum match criteria.")
+        return
+        
+    await status_msg.delete()
+    
+    # Send each matching job to user
+    for job, gemini_data in top_results:
+        score_data = {
+            "score": gemini_data.get("score", 0.0),
+            "label": "🔥 Hot Match" if gemini_data.get("score", 0.0) >= 7.0 else "✅ Good Match",
+            "matched_keywords": gemini_data.get("detected_tech", []),
+            "gemini": gemini_data
+        }
+        msg = format_job_message(
+            title=job["title"],
+            company=job["company"],
+            location=job["location"],
+            link=job["link"],
+            source=job["source"],
+            score_data=score_data,
+            salary=job.get("salary")
+        )
+        await update.effective_message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
+        await asyncio.sleep(1)
+
 
 # ─── Scheduler Loop Tasks ──────────────────────────────────────────────────────
 
@@ -1299,6 +1547,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("addkeyword", addkeyword_cmd))
     application.add_handler(CommandHandler("removekeyword", removekeyword_cmd))
     application.add_handler(CommandHandler("keywords", keywords_cmd))
+    application.add_handler(CommandHandler("search", search_cmd))
     
     log.info("Starting Telegram Bot long-polling...")
     application.run_polling()
