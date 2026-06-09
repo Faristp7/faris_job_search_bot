@@ -415,23 +415,30 @@ def format_job_message(title, company, location, link, source, score_data: dict,
     gemini_line = ""
     gemini_data = score_data.get("gemini")
     if gemini_data and isinstance(gemini_data, dict):
-        g_score = gemini_data.get("score", 0.0)
-        g_reason = html.escape(str(gemini_data.get("reason", "No reason provided.")), quote=False)
-        g_tech = gemini_data.get("detected_tech", [])
-        
-        g_filled = round(g_score)
-        g_bar = "█" * g_filled + "░" * (10 - g_filled)
-        
-        g_tech_line = ""
-        if g_tech:
-            g_tech_esc = [html.escape(str(t), quote=False) for t in g_tech]
-            g_tech_line = f"🛠️ <b>AI Stack:</b> <code>{', '.join(g_tech_esc)}</code>\n"
+        if gemini_data.get("success", False):
+            g_score = gemini_data.get("score", 0.0)
+            g_reason = html.escape(str(gemini_data.get("reason", "No reason provided.")), quote=False)
+            g_tech = gemini_data.get("detected_tech", [])
             
-        gemini_line = (
-            f"🤖 <b>AI Fit Score:</b> <b>{g_score}/10</b>  <code>{g_bar}</code>\n"
-            f"💡 <b>AI Insight:</b> <i>{g_reason}</i>\n"
-            f"{g_tech_line}\n"
-        )
+            g_filled = round(g_score)
+            g_bar = "█" * g_filled + "░" * (10 - g_filled)
+            
+            g_tech_line = ""
+            if g_tech:
+                g_tech_esc = [html.escape(str(t), quote=False) for t in g_tech]
+                g_tech_line = f"🛠️ <b>AI Stack:</b> <code>{', '.join(g_tech_esc)}</code>\n"
+                
+            gemini_line = (
+                f"🤖 <b>AI Fit Score:</b> <b>{g_score}/10</b>  <code>{g_bar}</code>\n"
+                f"💡 <b>AI Insight:</b> <i>{g_reason}</i>\n"
+                f"{g_tech_line}\n"
+            )
+        else:
+            reason = html.escape(str(gemini_data.get("reason", "AI evaluation skipped or failed.")), quote=False)
+            gemini_line = (
+                f"🤖 <b>AI Fit Score:</b> <i>(API offline)</i>\n"
+                f"💡 <b>AI Insight:</b> <i>{reason}</i>\n\n"
+            )
 
     return (
         f"{source_emoji} <b>New Job Alert — {source_esc}</b>\n\n"
@@ -1213,8 +1220,9 @@ async def run_scraper_async(application):
             )
             score_data["gemini"] = gemini_data
             
-            # If Gemini thinks this is a very weak match, filter it out
-            if gemini_data.get("score", 0.0) < 3.0:
+            # If Gemini thinks this is a very weak match, filter it out.
+            # ONLY skip if the Gemini API call was successful.
+            if gemini_data.get("success", False) and gemini_data.get("score", 0.0) < 3.0:
                 log.info(f"Skipping job '{job['title']}' at {job['company']} due to low Gemini AI score: {gemini_data.get('score')}/10")
                 skipped_by_score_count += 1
                 continue
@@ -1400,42 +1408,71 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     query = " ".join(context.args).strip()
-    status_msg = await update.effective_message.reply_text("🔍 <i>Analyzing your search query with Gemini...</i>", parse_mode="HTML")
+    status_msg = await update.effective_message.reply_text("🔍 <i>Analyzing your search query...</i>", parse_mode="HTML")
     
     parsed = await parse_search_query(query)
     keywords = parsed.get("keywords", [])
     location = parsed.get("location", "")
     
     if not keywords:
-        await status_msg.edit_text("❌ Gemini was unable to extract search keywords from your query. Please try again with details like title/tech stack.")
+        await status_msg.edit_text("❌ Unable to extract search keywords from your query. Please try again with details like title/tech stack.")
         return
         
     keywords_str = ", ".join(f"<code>{k}</code>" for k in keywords)
     loc_str = f" in <code>{location}</code>" if location else ""
-    await status_msg.edit_text(f"⚡ <b>Gemini Keywords:</b> {keywords_str}{loc_str}\n\n🔍 <i>Scraping matching remote jobs on-demand...</i>", parse_mode="HTML")
+    if parsed.get("success", False):
+        await status_msg.edit_text(f"⚡ <b>Gemini Keywords:</b> {keywords_str}{loc_str}\n\n🔍 <i>Scraping matching remote jobs on-demand...</i>", parse_mode="HTML")
+    else:
+        await status_msg.edit_text(f"⚡ <b>Local Keywords (AI offline):</b> {keywords_str}{loc_str}\n\n🔍 <i>Scraping matching remote jobs on-demand...</i>", parse_mode="HTML")
     
     jobs = await search_jobs_on_demand(keywords, location)
     if not jobs:
         await status_msg.edit_text("😴 No matching jobs found from on-demand sources.")
         return
         
-    await status_msg.edit_text(f"✅ Found {len(jobs)} candidate jobs.\n🤖 <i>Evaluating compatibility with Gemini AI...</i>", parse_mode="HTML")
+    await status_msg.edit_text(f"✅ Found {len(jobs)} candidate jobs.\n🤖 <i>Evaluating compatibility with AI...</i>", parse_mode="HTML")
     
     scored = []
     # Limit to top 8 candidates to avoid hitting API rate limits during queries
     for job in jobs[:8]:
         try:
+            # Score locally first
+            local_score = score_job(
+                title=job["title"],
+                company=job["company"],
+                location=job["location"],
+                description=job.get("description", "")
+            )
+            
             gemini_data = await evaluate_job_fit(
                 title=job["title"],
                 company=job["company"],
                 location=job["location"],
                 description=job.get("description", "")
             )
-            scored.append((job, gemini_data))
+            
+            # Combine or fallback: if Gemini evaluation was successful, use its data.
+            # Otherwise, use local score and construct a fallback gemini_data structure.
+            if gemini_data.get("success", False):
+                score_data = {
+                    "score": gemini_data.get("score", 0.0),
+                    "label": "🔥 Hot Match" if gemini_data.get("score", 0.0) >= 7.0 else "✅ Good Match",
+                    "matched_keywords": gemini_data.get("detected_tech", []),
+                    "gemini": gemini_data
+                }
+            else:
+                score_data = {
+                    "score": local_score.get("score", 0.0),
+                    "label": local_score.get("label", "👀 Possible Match"),
+                    "matched_keywords": local_score.get("matched_keywords", []),
+                    "gemini": gemini_data
+                }
+            
+            scored.append((job, score_data))
         except Exception as e:
             log.error(f"Error evaluating job during on-demand search: {e}")
             
-    # Sort by Gemini score descending
+    # Sort by score descending (can be Gemini or local score depending on success)
     scored.sort(key=lambda x: x[1].get("score", 0.0), reverse=True)
     
     # Filter for reasonable fit (score >= 3.0) and take top 5
@@ -1448,13 +1485,7 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_msg.delete()
     
     # Send each matching job to user
-    for job, gemini_data in top_results:
-        score_data = {
-            "score": gemini_data.get("score", 0.0),
-            "label": "🔥 Hot Match" if gemini_data.get("score", 0.0) >= 7.0 else "✅ Good Match",
-            "matched_keywords": gemini_data.get("detected_tech", []),
-            "gemini": gemini_data
-        }
+    for job, score_data in top_results:
         msg = format_job_message(
             title=job["title"],
             company=job["company"],

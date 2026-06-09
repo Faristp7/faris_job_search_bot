@@ -1,0 +1,44 @@
+FARIS RAHMAN
+Full-Stack Developer
+Kerala, India | +91 9562146113 | faristpwork@gmail.com | faris.co.in | github.com/faristp7 | https://www.linkedin.com/in/faristp7/
+
+Professional Summary
+Full-Stack Developer with 2+ years of experience building scalable web applications using React, Next.js, Node.js, TypeScript, and PostgreSQL. Delivered production-grade SaaS and enterprise solutions serving 10K+ monthly users, with expertise in REST APIs, Server-Side Rendering (SSR), SEO optimization, CI/CD pipelines, authentication systems, and multi-tenant architecture.
+
+Technical Skills
+Languages: TypeScript, JavaScript, SQL, HTML5, CSS3
+Frontend: React.js, Next.js, Redux, Zustand, TanStack Query, TailwindCSS, Bootstrap
+Backend: Node.js, NestJS, Express.js, REST APIs, JWT Authentication
+Databases: PostgreSQL, MongoDB, Prisma ORM, Redis
+Cloud & DevOps: AWS (EC2, Route 53), Docker, NGINX, GitHub Actions, CI/CD Pipelines
+Tools & Integrations: BullMQ, Nodemailer, Razorpay, Firebase, Cloudinary, GA4
+Practices: Clean Architecture, Microservices, RBAC, Multi-Tenant SaaS, Agile, Git
+
+Professional Experience
+Full-Stack Developer
+Accorelabs (Remote), Dec 2025 - May 2026, Dubai, UAE
+- Built OCR-based invoice parsing using Tesseract for bilingual Arabic/English ZATCA-compliant invoices.
+- Developed reusable React.js features integrated with .NET Core backend services and REST APIs.
+
+Full-Stack Developer
+Diffrenz Business Solutions, Feb 2024 - Nov 2025, Kerala, India
+- Led frontend development for Dollar and Thrifty car rental platforms serving 10K+ monthly users.
+- Rebuilt Thrifty platform from React to Next.js, improving Core Web Vitals and SEO performance through SSR.
+- Shipped 5+ production features using TanStack Query, Zustand, and GitHub Actions CI/CD pipelines.
+
+Junior Developer (Trainee)
+Brototype, Oct 2022 - Jan 2024, Kozhikode, Kerala, India
+- Built responsive frontend applications and collaborated on MERN stack projects involving REST APIs, authentication, and state management.
+
+Key Projects
+Thrifty UAE — Car Rental Platform (Next.js, React, TanStack Query, Zustand, REST API)
+https://www.thriftyuae.com
+- Rebuilt legacy React platform to Next.js, improving SEO and page load speed through server-side rendering.
+- Developed flexi-lease and subscription booking flows integrated with backend microservices.
+
+Education
+Bachelor of Computer Applications (BCA) (2026)
+Indira Gandhi National Open University (IGNOU)
+
+Senior Secondary School — Commerce (2022)
+National Institute of Open Schooling (NIOS)

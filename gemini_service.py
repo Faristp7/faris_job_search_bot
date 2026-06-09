@@ -2,20 +2,23 @@ import logging
 import json
 import httpx
 import re
+import asyncio
 from config import GEMINI_API_KEY
 
 log = logging.getLogger(__name__)
 
 # Base API configuration
-# Using the gemini-2.5-flash model as requested by the user.
+# Primary model as requested by the user, followed by suitable fallback models.
 GEMINI_MODEL = "gemini-2.5-flash"
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-pro", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "Gemini 2.5 Flash Lite", "Gemini 2.5 Pro"]
 
 async def call_gemini_api(prompt: str, json_mode: bool = False, enable_search: bool = False) -> str | None:
     """
     Sends an async POST request to the Gemini API with the given prompt.
     If json_mode is True, requests the model to output a JSON-formatted string.
     If enable_search is True, enables Google Search grounding tools.
+    Implements exponential backoff retries on 429/5xx errors and falls back to
+    alternative models if needed.
     """
     if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
         log.error("Gemini API key is not configured. Skipping Gemini call.")
@@ -44,25 +47,65 @@ async def call_gemini_api(prompt: str, json_mode: bool = False, enable_search: b
     if enable_search:
         payload["tools"] = [{"googleSearch": {}}]
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(API_URL, headers=headers, json=payload)
-            response.raise_for_status()
-            response_data = response.json()
+    models_to_try = [GEMINI_MODEL] + FALLBACK_MODELS
+    max_retries = 3
+    base_delay = 2.0
 
-            # Navigate response structure to extract generated text
-            candidates = response_data.get("candidates", [])
-            if candidates:
-                content = candidates[0].get("content", {})
-                parts = content.get("parts", [])
-                if parts:
-                    return parts[0].get("text", "").strip()
-            
-            log.warning("Gemini response did not contain candidates or parts.")
-            return None
-    except Exception as e:
-        log.error(f"Gemini API request failed: {e}")
-        return None
+    for model in models_to_try:
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        
+        for attempt in range(max_retries):
+            try:
+                log.info(f"Sending request to Gemini model '{model}' (attempt {attempt + 1}/{max_retries})...")
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(api_url, headers=headers, json=payload)
+                    
+                    if response.status_code == 429:
+                        delay = base_delay * (2 ** attempt)
+                        log.warning(f"Gemini API returned 429 (Too Many Requests) for model '{model}'. Retrying in {delay}s...")
+                        await asyncio.sleep(delay)
+                        continue
+                        
+                    response.raise_for_status()
+                    response_data = response.json()
+
+                    # Navigate response structure to extract generated text
+                    candidates = response_data.get("candidates", [])
+                    if candidates:
+                        content = candidates[0].get("content", {})
+                        parts = content.get("parts", [])
+                        if parts:
+                            return parts[0].get("text", "").strip()
+                    
+                    log.warning(f"Gemini response for model '{model}' did not contain candidates or parts.")
+                    # If response parsed successfully but returned no parts, we don't need to retry this model, try next one
+                    break
+                    
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code
+                if status_code in [500, 502, 503, 504]:
+                    delay = base_delay * (2 ** attempt)
+                    log.warning(f"Gemini API returned server error {status_code} for model '{model}'. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    log.error(f"Gemini API request failed for model '{model}' with status {status_code}: {e}")
+                    # Non-retryable error (e.g. 400 Bad Request, 403 Forbidden)
+                    break
+            except httpx.RequestError as e:
+                # Network-related issues (e.g. timeout, connection failure)
+                delay = base_delay * (2 ** attempt)
+                log.warning(f"Network error calling Gemini API for model '{model}': {e}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            except Exception as e:
+                log.error(f"Unexpected error calling Gemini API for model '{model}': {e}")
+                break
+        else:
+            log.warning(f"All {max_retries} attempts failed for model '{model}'.")
+
+    log.error("All configured Gemini models failed or rate-limited.")
+    return None
 
 
 async def evaluate_job_fit(title: str, company: str, location: str, description: str = "") -> dict:
@@ -136,17 +179,67 @@ Output format must be strictly JSON:
         return default_result
 
 
+def _local_parse_search_query(user_query: str) -> dict:
+    """
+    Extracts keywords and location using a local dictionary/pattern matching fallback.
+    """
+    try:
+        from scorer import SCORING_PROFILE, LOCATION_SCORES
+    except ImportError:
+        # Fallback to hardcoded list if there's a circular import issue or scorer is missing
+        SCORING_PROFILE = {
+            "nestjs": 1.5, "nest.js": 1.5, "node.js": 1.3, "nodejs": 1.3, 
+            "express.js": 1.2, "expressjs": 1.2, "typescript": 1.2, 
+            "postgresql": 1.2, "prisma": 1.2, "mongodb": 1.2, "redis": 1.0,
+            "next.js": 1.0, "nextjs": 1.0, "react": 1.0, "react.js": 1.0, 
+            "zustand": 1.0, "tanstack": 1.0, "react query": 1.0, "redux": 0.8,
+            "tailwind": 0.8, "tailwindcss": 0.8, "docker": 1.0, "aws": 1.0,
+            "github actions": 1.0, "ci/cd": 1.0, "nginx": 0.8, "zatca": 2.0, 
+            "ocr": 2.0, "tesseract": 2.0, "multi-tenant": 1.8, "multitenant": 1.8, 
+            "bullmq": 1.8, "razorpay": 1.5, "microservices": 1.5
+        }
+        LOCATION_SCORES = {
+            "kerala": 1.5, "kochi": 1.5, "kozhikode": 1.5, "trivandrum": 1.2,
+            "thiruvananthapuram": 1.2, "infopark": 1.5, "technopark": 1.5,
+            "remote": 1.2, "india": 0.8, "dubai": 1.0, "uae": 1.0
+        }
+
+    query_lower = user_query.lower()
+    
+    # Try matching SCORING_PROFILE keys
+    keywords = []
+    for tech in SCORING_PROFILE.keys():
+        if tech in query_lower:
+            keywords.append(tech)
+
+    # Try matching location
+    location = ""
+    for loc in LOCATION_SCORES.keys():
+        if loc in query_lower:
+            location = loc
+            break
+
+    # If no tech keywords found, do simple string split as a broader fallback
+    if not keywords:
+        words = [w.strip(",.?!()\"'") for w in query_lower.split()]
+        stopwords = {
+            "job", "jobs", "in", "with", "remote", "developer", "engineer", 
+            "for", "a", "an", "the", "and", "or", "of", "to", "need", "needed", "find", "search"
+        }
+        keywords = [w for w in words if len(w) > 2 and w not in stopwords and w not in LOCATION_SCORES]
+
+    return {
+        "keywords": list(set(keywords))[:5],
+        "location": location,
+        "success": False
+    }
+
+
 async def parse_search_query(user_query: str) -> dict:
     """
     Parses a natural language search query from the user (e.g., "remote NestJS developer jobs in Kochi")
     into structured search keywords and location filters.
     """
-    default_result = {
-        "keywords": [],
-        "location": "",
-        "success": False
-    }
-
     prompt = f"""
 You are an expert recruitment assistant parsing a job search request.
 User query: "{user_query}"
@@ -163,7 +256,7 @@ Output format must be strictly JSON:
     log.info(f"Running Gemini query parser for query: '{user_query}'")
     response_text = await call_gemini_api(prompt, json_mode=True)
     if not response_text:
-        return default_result
+        return _local_parse_search_query(user_query)
 
     try:
         result = json.loads(response_text)
@@ -174,7 +267,7 @@ Output format must be strictly JSON:
         }
     except Exception as e:
         log.error(f"Error parsing Gemini search query response: {e}. Raw response: {response_text}")
-        return default_result
+        return _local_parse_search_query(user_query)
 
 
 async def scrape_indeed_jobs_via_gemini() -> list[dict]:
@@ -185,11 +278,11 @@ async def scrape_indeed_jobs_via_gemini() -> list[dict]:
     """
     prompt = (
         "You are a professional recruitment assistant. "
-        "Step 1: Use the web search tool to search Indeed (indeed.com or indeed.co.in) for active, recently posted remote jobs or jobs located in Kerala, India matching the keywords: NestJS, NodeJS, or React developer. "
+        "Step 1: Use the web search tool to search Indeed (indeed.com or in.indeed.com) for active, recently posted remote jobs or jobs located in Kerala, India matching the keywords: NestJS, NodeJS, or React developer. "
         "Step 2: Extract details for up to 5 active listings, including job title, company name, location, source URL/link, and a brief description/tech stack. "
         "Step 3: Format the output as a valid JSON array of objects inside a markdown code block (```json ... ```). "
         "Each object must have these keys exactly: \"title\", \"company\", \"location\", \"url\", \"description\". "
-        "Do not output any introductory or conversational text, only the markdown JSON code block."
+        "Do not output any introductory or conversational text, only the markdown JSON code block. Make sure the links are working don't send broken links"
     )
     
     log.info("Querying Gemini Search Grounding for Indeed jobs...")
