@@ -48,7 +48,7 @@ KEYWORDS = [
 
 
 # ─── Scraper settings ─────────────────────────────────────────────────────────
-CHECK_INTERVAL_MINUTES = 10       # how often to poll (10 min is safe, don't go lower)
+CHECK_INTERVAL_MINUTES = 30       # how often to poll (30 min is safe, don't go lower)
 SEEN_JOBS_FILE = os.path.join(BASE_DIR, "seen_jobs.json")  # FIXED: use absolute path for seen_jobs.json
 
 

@@ -1057,7 +1057,9 @@ async def scrape_indeed(seen: OrderedSet) -> list:
     Scrapes Indeed jobs using Gemini Search Grounding.
     """
     try:
-        jobs = await scrape_indeed_jobs_via_gemini()
+        with state_lock:
+            kws = list(ACTIVE_KEYWORDS)
+        jobs = await scrape_indeed_jobs_via_gemini(kws)
         filtered_jobs = []
         for job in jobs:
             link = job.get("link", "")
@@ -1211,22 +1213,7 @@ async def run_scraper_async(application):
         )
         
         if score_data["send"]:
-            # Perform deep AI validation using Gemini
-            gemini_data = await evaluate_job_fit(
-                title=job["title"],
-                company=job["company"],
-                location=job["location"],
-                description=job.get("description", "")
-            )
-            score_data["gemini"] = gemini_data
-            
-            # If Gemini thinks this is a very weak match, filter it out.
-            # ONLY skip if the Gemini API call was successful.
-            if gemini_data.get("success", False) and gemini_data.get("score", 0.0) < 3.0:
-                log.info(f"Skipping job '{job['title']}' at {job['company']} due to low Gemini AI score: {gemini_data.get('score')}/10")
-                skipped_by_score_count += 1
-                continue
-                
+            score_data["gemini"] = None
             scored_jobs.append((job, score_data))
         else:
             skipped_by_score_count += 1
@@ -1430,13 +1417,13 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("😴 No matching jobs found from on-demand sources.")
         return
         
-    await status_msg.edit_text(f"✅ Found {len(jobs)} candidate jobs.\n🤖 <i>Evaluating compatibility with AI...</i>", parse_mode="HTML")
+    await status_msg.edit_text(f"✅ Found {len(jobs)} candidate jobs.\n🎯 <i>Scoring candidate jobs...</i>", parse_mode="HTML")
     
     scored = []
-    # Limit to top 8 candidates to avoid hitting API rate limits during queries
-    for job in jobs[:8]:
+    # Limit to top 15 candidates (local scoring is extremely fast)
+    for job in jobs[:15]:
         try:
-            # Score locally first
+            # Score locally
             local_score = score_job(
                 title=job["title"],
                 company=job["company"],
@@ -1444,29 +1431,12 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 description=job.get("description", "")
             )
             
-            gemini_data = await evaluate_job_fit(
-                title=job["title"],
-                company=job["company"],
-                location=job["location"],
-                description=job.get("description", "")
-            )
-            
-            # Combine or fallback: if Gemini evaluation was successful, use its data.
-            # Otherwise, use local score and construct a fallback gemini_data structure.
-            if gemini_data.get("success", False):
-                score_data = {
-                    "score": gemini_data.get("score", 0.0),
-                    "label": "🔥 Hot Match" if gemini_data.get("score", 0.0) >= 7.0 else "✅ Good Match",
-                    "matched_keywords": gemini_data.get("detected_tech", []),
-                    "gemini": gemini_data
-                }
-            else:
-                score_data = {
-                    "score": local_score.get("score", 0.0),
-                    "label": local_score.get("label", "👀 Possible Match"),
-                    "matched_keywords": local_score.get("matched_keywords", []),
-                    "gemini": gemini_data
-                }
+            score_data = {
+                "score": local_score.get("score", 0.0),
+                "label": local_score.get("label", "👀 Possible Match"),
+                "matched_keywords": local_score.get("matched_keywords", []),
+                "gemini": None
+            }
             
             scored.append((job, score_data))
         except Exception as e:
@@ -1556,7 +1526,7 @@ async def post_init(application):
     msg = (
         "🤖 <b>Job Alert Bot is now running!</b>\n\n"
         "I'll ping you the moment a matching job drops on LinkedIn, Wellfound, Internshala, Remotive, Jobicy, Arbeitnow, or TheMuse.\n\n"
-        "<i>Checking every 10 minutes...</i>"
+        "<i>Checking every 30 minutes...</i>"
     )
     await send_telegram_async(application, msg)
     log.info("Startup Telegram message sent and background task loops started.")

@@ -270,20 +270,45 @@ Output format must be strictly JSON:
         return _local_parse_search_query(user_query)
 
 
-async def scrape_indeed_jobs_via_gemini() -> list[dict]:
+async def scrape_indeed_jobs_via_gemini(keywords: list[str] = None) -> list[dict]:
     """
-    Uses Gemini Search Grounding to find recently posted remote or Kerala-based
-    NestJS, NodeJS, or React developer jobs on Indeed.
+    Uses Gemini Search Grounding to find recently posted jobs on Indeed (indeed.com or in.indeed.com)
+    using the active search keywords, based on the user's resume, and targeting preferred locations
+    (Kochi, Kozhikode, and Remote).
     Returns a list of parsed job dictionaries.
     """
-    prompt = (
-        "You are a professional recruitment assistant. "
-        "Step 1: Use the web search tool to search Indeed (indeed.com or in.indeed.com) for active, recently posted remote jobs or jobs located in Kerala, India matching the keywords: NestJS, NodeJS, or React developer. "
-        "Step 2: Extract details for up to 5 active listings, including job title, company name, location, source URL/link, and a brief description/tech stack. "
-        "Step 3: Format the output as a valid JSON array of objects inside a markdown code block (```json ... ```). "
-        "Each object must have these keys exactly: \"title\", \"company\", \"location\", \"url\", \"description\". "
-        "Do not output any introductory or conversational text, only the markdown JSON code block. Make sure the links are working don't send broken links"
-    )
+    import os
+    # Load resume details dynamically
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    resume_path = os.path.join(base_dir, "resume.txt")
+    resume_context = ""
+    if os.path.exists(resume_path):
+        try:
+            with open(resume_path, "r", encoding="utf-8") as f:
+                resume_context = f.read().strip()
+        except Exception as e:
+            log.error(f"Error reading resume.txt: {e}")
+
+    # Format keywords
+    kw_str = ", ".join(keywords) if keywords else "NestJS, Node.js, React, TypeScript"
+
+    prompt = f"""
+You are a professional recruitment assistant.
+
+Step 1: Use the web search tool to search Indeed (indeed.com or in.indeed.com) for active, recently posted jobs matching:
+- Search Keywords: {kw_str}
+- Locations: Kochi, Kozhikode, or Remote
+- Candidate Profile (Resume Summary):
+\"\"\"
+{resume_context}
+\"\"\"
+
+Step 2: Extract details for up to 5 active listings that fit the candidate's experience level (mid-level, ~2.5 years) and skills based on the resume.
+
+Step 3: Format the output as a valid JSON array of objects inside a markdown code block (```json ... ```).
+Each object must have these keys exactly: "title", "company", "location", "url", "description".
+Do not output any introductory or conversational text, only the markdown JSON code block. Ensure the links are valid Indeed job links and are not broken or placeholder links.
+"""
     
     log.info("Querying Gemini Search Grounding for Indeed jobs...")
     response_text = await call_gemini_api(prompt, json_mode=False, enable_search=True)
