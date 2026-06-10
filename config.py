@@ -85,3 +85,7 @@ CUTSHORT_KEYWORDS = [
 # ─── Infopark Scraper settings ────────────────────────────────────────────────
 INFOPARK_SEARCH_URL = "https://infopark.in/companies/job-search"
 
+
+# ─── SimplyHired Scraper settings ─────────────────────────────────────────────
+SIMPLYHIRED_SEARCH_URL = "https://www.simplyhired.co.in/search?q=next+js+developer&l=kochi,+kerala"
+

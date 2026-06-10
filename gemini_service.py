@@ -270,14 +270,93 @@ Output format must be strictly JSON:
         return _local_parse_search_query(user_query)
 
 
+def is_indeed_jk_placeholder(jk: str) -> bool:
+    jk = str(jk).lower().strip()
+    
+    # Explicit list of common LLM synthetic job keys (including the one the user ran into)
+    placeholders = [
+        "c3b4a5d6e7f89012", "c3b4a5d6e7f890", "1234567890abcdef", 
+        "abcdef1234567890", "0123456789abcdef", "abcdef0123456789", 
+        "1234567890", "abcdef", "fedcba", "a1b2c3d4e5f6g7h8",
+        "c3b4a5d6e7f8901"
+    ]
+    if any(p in jk for p in placeholders):
+        return True
+        
+    # Check for simple sequences like abcdef, 123456, fedcba
+    if any(seq in jk for seq in ["abcdef", "bcdefg", "cdefgh", "123456", "234567", "345678", "456789", "567890"]):
+        return True
+    if any(seq in jk for seq in ["fedcba", "edcba9", "654321", "987654"]):
+        return True
+        
+    # Real random hex keys have a high diversity of characters
+    # If the unique characters count in a 16-character string is very low (e.g. <= 4), it's highly likely fake
+    if len(jk) >= 12 and len(set(jk)) <= 4:
+        return True
+        
+    # Check repeating structures like "abab", "1212" etc., or same char repeating many times
+    for char in set(jk):
+        if jk.count(char) >= 6:
+            return True
+            
+    return False
+
+
+async def resolve_redirect_link(url: str) -> str:
+    """
+    Follows redirect of a Google/Vertex Search Grounding link to find the final destination URL.
+    """
+    from urllib.parse import urlparse, parse_qs
+    url_str = str(url).strip()
+    if not url_str:
+        return url_str
+        
+    # Check if it looks like a redirect link
+    if not any(domain in url_str.lower() for domain in ["google.com", "vertexaisearch.cloud.google.com", "googleusercontent.com"]):
+        return url_str
+
+    # Fast check: If it is a google.com/url redirect, we can parse the target 'q' query parameter directly
+    try:
+        parsed_url = urlparse(url_str)
+        if "google.com" in parsed_url.netloc.lower():
+            queries = parse_qs(parsed_url.query)
+            if "q" in queries:
+                extracted_url = queries["q"][0]
+                if extracted_url.startswith("http"):
+                    log.info(f"Parsed destination URL from query parameter: {extracted_url}")
+                    return extracted_url
+    except Exception as e:
+        log.warning(f"Error parsing google redirect parameter: {e}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+    
+    try:
+        log.info(f"Resolving search grounding redirect URL: {url_str}")
+        # Use a client with follow_redirects=True to get the final target page.
+        # Disable SSL verification to prevent SSL handshake issues.
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, verify=False) as client:
+            response = await client.get(url_str, headers=headers)
+            resolved = str(response.url)
+            log.info(f"Successfully resolved redirect to: {resolved}")
+            return resolved
+    except Exception as e:
+        log.warning(f"Error resolving redirect for {url_str}: {e}")
+        return url_str
+
+
 async def scrape_indeed_jobs_via_gemini(keywords: list[str] = None) -> list[dict]:
     """
     Uses Gemini Search Grounding to find recently posted jobs on Indeed (indeed.com or in.indeed.com)
     using the active search keywords, based on the user's resume, and targeting preferred locations
     (Kochi, Kozhikode, and Remote).
+    Only returns jobs posted within the last 3 days.
     Returns a list of parsed job dictionaries.
     """
     import os
+    from datetime import datetime
+    from urllib.parse import urlparse, parse_qs
     # Load resume details dynamically
     base_dir = os.path.dirname(os.path.abspath(__file__))
     resume_path = os.path.join(base_dir, "resume.txt")
@@ -304,10 +383,14 @@ Step 1: Use the web search tool to search Indeed (indeed.com or in.indeed.com) f
 \"\"\"
 
 Step 2: Extract details for up to 5 active listings that fit the candidate's experience level (mid-level, ~2.5 years) and skills based on the resume.
+CRITICAL REQUIREMENT: Only extract jobs that were posted within the last 3 days (do not include jobs older than 3 days).
 
 Step 3: Format the output as a valid JSON array of objects inside a markdown code block (```json ... ```).
-Each object must have these keys exactly: "title", "company", "location", "url", "description".
-Do not output any introductory or conversational text, only the markdown JSON code block. Ensure the links are valid Indeed job links and are not broken or placeholder links.
+Each object must have these keys exactly: "title", "company", "location", "url", "description", "posted_date".
+- "posted_date" should be a date string (like "2026-06-09" or "2 days ago") indicating when the job was posted.
+- "url" MUST be the exact, unmodified apply link found in the web search results. Under NO circumstances are you allowed to invent, estimate, guess, or construct Indeed URLs using placeholder job keys (like jk=c3b4a5d6e7f89012 or similar). If a real URL is not available in the search results, DO NOT include the job listing at all.
+
+Do not output any introductory or conversational text, only the markdown JSON code block.
 """
     
     log.info("Querying Gemini Search Grounding for Indeed jobs...")
@@ -333,11 +416,63 @@ Do not output any introductory or conversational text, only the markdown JSON co
             for item in jobs_data:
                 if not isinstance(item, dict):
                     continue
+                
+                # Check for Indeed placeholder URL
+                link = str(item.get("url", item.get("link", ""))).strip()
+                
+                # Resolve google grounding redirect URLs
+                if "google.com" in link.lower() or "googleusercontent.com" in link.lower() or "vertexaisearch.cloud.google.com" in link.lower():
+                    link = await resolve_redirect_link(link)
+                
+                if "indeed.com" in link.lower():
+                    try:
+                        parsed_link = urlparse(link)
+                        queries = parse_qs(parsed_link.query)
+                        jk_val = queries.get("jk", [None])[0]
+                        if jk_val:
+                            if is_indeed_jk_placeholder(jk_val):
+                                log.info(f"Indeed job skipped (placeholder jk '{jk_val}'): {item.get('title')}")
+                                continue
+                        else:
+                            if "viewjob" in parsed_link.path or "clk" in parsed_link.path:
+                                log.info(f"Indeed job skipped (no jk in indeed URL): {item.get('title')}")
+                                continue
+                    except Exception as e:
+                        log.warning(f"Error parsing indeed link query: {e}")
+
+                # Programmatic check for posted_date age
+                posted_date_str = str(item.get("posted_date", "")).strip().lower()
+                if posted_date_str:
+                    # Filter out older ones based on text cues
+                    if any(x in posted_date_str for x in ["week", "month", "year"]):
+                        log.info(f"Indeed job skipped (older than 3 days by text): {item.get('title')} - Posted: {posted_date_str}")
+                        continue
+                    
+                    # Extract days ago if relative
+                    days_match = re.search(r"(\d+)\s+day", posted_date_str)
+                    if days_match:
+                        days = int(days_match.group(1))
+                        if days > 3:
+                            log.info(f"Indeed job skipped (older than 3 days by day count): {item.get('title')} - Posted: {posted_date_str}")
+                            continue
+                            
+                    # Parse YYYY-MM-DD
+                    date_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", posted_date_str)
+                    if date_match:
+                        try:
+                            job_date = datetime.strptime(date_match.group(0), "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - job_date).days
+                            if days_ago > 3:
+                                log.info(f"Indeed job skipped (older than 3 days by date parsing): {item.get('title')} - Posted: {posted_date_str}")
+                                continue
+                        except Exception:
+                            pass
+                
                 parsed_jobs.append({
                     "title": str(item.get("title", "N/A")),
                     "company": str(item.get("company", "N/A")),
                     "location": str(item.get("location", "N/A")),
-                    "link": str(item.get("url", item.get("link", ""))),
+                    "link": link,
                     "source": "Indeed",
                     "salary": None,
                     "description": str(item.get("description", ""))

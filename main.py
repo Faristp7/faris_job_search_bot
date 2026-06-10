@@ -3,15 +3,18 @@ import json
 import os
 import logging
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 import time
 import asyncio
+import socket
+import httpx
 from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SEEN_JOBS_FILE, CHECK_INTERVAL_MINUTES,
     GLASSDOOR_KEYWORDS, CUTSHORT_KEYWORDS, INFOPARK_SEARCH_URL,
-    REMOTIVE_KEYWORDS, JOBICY_KEYWORDS, THEMUSE_CATEGORIES
+    REMOTIVE_KEYWORDS, JOBICY_KEYWORDS, THEMUSE_CATEGORIES,
+    SIMPLYHIRED_SEARCH_URL
 )
 from scorer import score_job, MIN_SCORE
 from gemini_service import evaluate_job_fit, parse_search_query, scrape_indeed_jobs_via_gemini
@@ -19,6 +22,62 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import html  # FIXED: HTML escaping for Telegram parse mode safety
 import threading  # FIXED: thread safety lock for global state and file accesses
+
+# Async Link Validity Checker
+async def is_link_valid_async(url: str) -> bool:
+    if not url:
+        return False
+    
+    # Parse URL and verify domain exists via DNS lookup
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+            
+        def dns_resolve():
+            try:
+                socket.gethostbyname(parsed.netloc.split(':')[0])
+                return True
+            except Exception:
+                return False
+                
+        dns_ok = await asyncio.to_thread(dns_resolve)
+        if not dns_ok:
+            log.warning(f"Link domain resolution failed: {url}")
+            return False
+    except Exception as e:
+        log.warning(f"Error parsing/resolving domain for link {url}: {e}")
+        return False
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+
+    try:
+        # Disable SSL verification to prevent ssl errors from discarding valid links
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, verify=False) as client:
+            status_code = None
+            try:
+                r = await client.head(url, headers=headers)
+                status_code = r.status_code
+                if status_code in [200, 201, 202, 301, 302, 303, 307, 308, 403, 429, 999]:
+                    return True
+                if status_code in [400, 405]:
+                    raise httpx.RequestError("HEAD not supported, trying GET")
+            except Exception:
+                # Fallback to GET stream
+                async with client.stream("GET", url, headers=headers) as response:
+                    status_code = response.status_code
+                    if status_code in [200, 201, 202, 301, 302, 303, 307, 308, 403, 429, 999]:
+                        return True
+            log.warning(f"Link validity check failed with status code {status_code}: {url}")
+            return False
+    except Exception as e:
+        log.warning(f"Link validity check failed with exception for {url}: {e}")
+        return False
+
 
 # Setup Logging
 logging.basicConfig(
@@ -386,7 +445,8 @@ def format_job_message(title, company, location, link, source, score_data: dict,
         "Remotive": "🌍",
         "Jobicy": "💻",
         "Arbeitnow": "🌐",
-        "TheMuse": "🎯"
+        "TheMuse": "🎯",
+        "SimplyHired": "🔍"
     }.get(source_esc, "📌")
 
     # FIXED: protection against None score_data
@@ -510,6 +570,28 @@ def scrape_linkedin(seen) -> list:
                     if not link or title == "N/A":
                         continue
 
+                    # Date check
+                    time_el = card.select_one("time")
+                    if time_el:
+                        datetime_str = time_el.get("datetime")
+                        if datetime_str:
+                            try:
+                                posted_date = datetime.strptime(datetime_str, "%Y-%m-%d").date()
+                                days_ago = (datetime.now().date() - posted_date).days
+                                if days_ago > 3:
+                                    continue
+                            except Exception:
+                                pass
+                        else:
+                            time_text = time_el.text.strip().lower()
+                            if any(x in time_text for x in ["week", "month", "year"]):
+                                continue
+                            days_match = re.search(r"(\d+)\s+day", time_text)
+                            if days_match:
+                                days = int(days_match.group(1))
+                                if days > 3:
+                                    continue
+
                     job_id = f"linkedin_{link}"
                     if job_id in seen:
                         continue
@@ -560,6 +642,17 @@ def scrape_remotive(seen: OrderedSet) -> list:
 
                     if not link or title == "N/A":
                         continue
+
+                    # Date check
+                    pub_date_str = job.get("publication_date")
+                    if pub_date_str:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - pub_date).days
+                            if days_ago > 3:
+                                continue
+                        except Exception as e:
+                            log.warning(f"Error parsing Remotive date '{pub_date_str}': {e}")
 
                     job_id = f"remotive_{link}"
                     if job_id in seen:
@@ -615,6 +708,24 @@ def scrape_jobicy(seen: OrderedSet) -> list:
                     if not link or title == "N/A":
                         continue
 
+                    # Date check
+                    pub_date_str = job.get("pubDate")
+                    if pub_date_str:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - pub_date).days
+                            if days_ago > 3:
+                                continue
+                        except Exception:
+                            try:
+                                import email.utils
+                                pub_datetime = email.utils.parsedate_to_datetime(pub_date_str)
+                                days_ago = (datetime.now(timezone.utc) - pub_datetime).days
+                                if days_ago > 3:
+                                    continue
+                            except Exception as e:
+                                log.warning(f"Error parsing Jobicy date '{pub_date_str}': {e}")
+
                     job_id = f"jobicy_{link}"
                     if job_id in seen:
                         continue
@@ -667,6 +778,17 @@ def scrape_arbeitnow(seen: OrderedSet) -> list:
 
                 if not link or title == "N/A":
                     continue
+
+                # Date check
+                created_at = job.get("created_at")
+                if created_at:
+                    try:
+                        pub_date = datetime.fromtimestamp(int(created_at)).date()
+                        days_ago = (datetime.now().date() - pub_date).days
+                        if days_ago > 3:
+                            continue
+                    except Exception as e:
+                        log.warning(f"Error parsing Arbeitnow date '{created_at}': {e}")
 
                 job_id = f"arbeitnow_{link}"
                 if job_id in seen:
@@ -739,6 +861,17 @@ def scrape_themuse(seen: OrderedSet) -> list:
                     if not link or title == "N/A":
                         continue
 
+                    # Date check
+                    pub_date_str = job.get("publication_date")
+                    if pub_date_str:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - pub_date).days
+                            if days_ago > 3:
+                                continue
+                        except Exception as e:
+                            log.warning(f"Error parsing The Muse date '{pub_date_str}': {e}")
+
                     job_id = f"themuse_{link}"
                     if job_id in seen:
                         continue
@@ -807,8 +940,20 @@ def scrape_internshala(seen: OrderedSet) -> list:
                     company = company_el.text.strip() if company_el else "Company"
                     location = location_el.text.strip() if location_el else "India"
                     link = f"https://internshala.com{link_el['href']}" if link_el else url
-                    job_id = f"internshala_{link}"
 
+                    # Date check
+                    date_el = card.select_one(".status-inactive, .status-success, .color-labels")
+                    if date_el:
+                        date_text = date_el.text.strip().lower()
+                        if any(x in date_text for x in ["week", "month", "year"]):
+                            continue
+                        days_match = re.search(r"(\d+)\s+day", date_text)
+                        if days_match:
+                            days = int(days_match.group(1))
+                            if days > 3:
+                                continue
+
+                    job_id = f"internshala_{link}"
                     if job_id in seen:
                         continue
                     if not matches_keywords(title + " " + category):
@@ -882,6 +1027,16 @@ def scrape_glassdoor(seen: OrderedSet) -> list:
                 if company == "N/A" or not company:
                     continue
                     
+                # Date check
+                card_text = card.get_text().strip().lower()
+                age_match = re.search(r"\b(\d+)d\b", card_text)
+                if age_match:
+                    days = int(age_match.group(1))
+                    if days > 3:
+                        continue
+                elif "30d+" in card_text:
+                    continue
+
                 job_id = f"glassdoor_{link}"
                 if job_id in seen:
                     continue
@@ -941,6 +1096,16 @@ def scrape_infopark(seen: OrderedSet) -> list:
             title = tds[1].text.strip()
             company = tds[2].text.strip()
             location = "Infopark, Kochi, Kerala"
+
+            # Date check
+            date_str = tds[0].text.strip()
+            try:
+                posted_date = datetime.strptime(date_str, "%d-%m-%Y").date()
+                days_ago = (datetime.now().date() - posted_date).days
+                if days_ago > 3:
+                    continue
+            except Exception as e:
+                log.warning(f"Error parsing Infopark date '{date_str}': {e}")
             
             link_a = tds[4].find("a", href=True) if len(tds) > 4 else row.find("a", href=True)
             link = link_a["href"].strip() if link_a else ""
@@ -968,6 +1133,101 @@ def scrape_infopark(seen: OrderedSet) -> list:
     return found
 
 
+def scrape_simplyhired(seen: OrderedSet) -> list:
+    found = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    }
+
+    try:
+        url = SIMPLYHIRED_SEARCH_URL
+        with httpx.Client(headers=headers, timeout=15) as client:
+            r = client.get(url)
+            if r.status_code != 200:
+                log.warning(f"SimplyHired scrape returned status code {r.status_code}")
+                return []
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            lis = soup.find_all("li")
+            job_cards = []
+            for li in lis:
+                a_tag = li.find("a", href=True)
+                if a_tag and "/job/" in a_tag["href"]:
+                    job_cards.append(li)
+            
+            for card in job_cards:
+                try:
+                    link_el = card.find("a", href=True)
+                    if not link_el:
+                        continue
+                    link = link_el["href"].strip()
+                    if not link.startswith("http"):
+                        link = f"https://www.simplyhired.co.in{link}"
+                    
+                    link = link.split("?")[0]
+                    
+                    title = "N/A"
+                    title_el = card.find(attrs={"data-testid": "searchSerpJobTitle"}) or card.find(["h2", "h3"])
+                    if title_el:
+                        title = title_el.text.strip()
+                    
+                    company = "N/A"
+                    company_el = card.find(attrs={"data-testid": "companyName"})
+                    if company_el:
+                        company = company_el.text.strip()
+                        
+                    location = "Kochi, Kerala"
+                    location_el = card.find(attrs={"data-testid": "searchSerpJobLocation"})
+                    if location_el:
+                        location = location_el.text.strip()
+                        
+                    salary = None
+                    salary_el = card.find(attrs={"data-testid": "salaryChip-0"})
+                    if salary_el:
+                        salary = salary_el.text.strip()
+                        
+                    date_el = card.find(attrs={"data-testid": "searchSerpJobDateStamp"})
+                    if date_el:
+                        date_text = date_el.text.strip().lower()
+                        if "30d+" in date_text:
+                            continue
+                        days_match = re.search(r"(\d+)d", date_text)
+                        if days_match:
+                            days = int(days_match.group(1))
+                            if days > 3:
+                                continue
+                                
+                    if title == "N/A" or not title:
+                        continue
+                        
+                    job_id = f"simplyhired_{link}"
+                    if job_id in seen:
+                        continue
+                    if not matches_keywords(title):
+                        continue
+                        
+                    seen.add(job_id)
+                    found.append({
+                        "title": title,
+                        "company": company,
+                        "location": location,
+                        "link": link,
+                        "source": "SimplyHired",
+                        "salary": salary,
+                        "description": ""
+                    })
+                except Exception as e:
+                    log.warning(f"Error parsing SimplyHired job card: {e}")
+                    continue
+    except Exception as e:
+        log.warning(f"SimplyHired scrape error: {e}")
+        
+    return found
+
+
 def _search_remotive_sync(keywords: list[str]) -> list[dict]:
     found = []
     seen = set()
@@ -987,6 +1247,18 @@ def _search_remotive_sync(keywords: list[str]) -> list[dict]:
                     link = job.get("url", "")
                     if not link or title == "N/A":
                         continue
+
+                    # Date check
+                    pub_date_str = job.get("publication_date")
+                    if pub_date_str:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - pub_date).days
+                            if days_ago > 3:
+                                continue
+                        except Exception as e:
+                            log.warning(f"Error parsing Remotive date '{pub_date_str}': {e}")
+
                     if link not in seen:
                         seen.add(link)
                         desc_html = job.get("description", "")
@@ -1018,6 +1290,25 @@ def _search_jobicy_sync(keywords: list[str]) -> list[dict]:
                     link = job.get("url", "")
                     if not link or title == "N/A":
                         continue
+
+                    # Date check
+                    pub_date_str = job.get("pubDate")
+                    if pub_date_str:
+                        try:
+                            pub_date = datetime.strptime(pub_date_str[:10], "%Y-%m-%d").date()
+                            days_ago = (datetime.now().date() - pub_date).days
+                            if days_ago > 3:
+                                continue
+                        except Exception:
+                            try:
+                                import email.utils
+                                pub_datetime = email.utils.parsedate_to_datetime(pub_date_str)
+                                days_ago = (datetime.now(timezone.utc) - pub_datetime).days
+                                if days_ago > 3:
+                                    continue
+                            except Exception as e:
+                                log.warning(f"Error parsing Jobicy date '{pub_date_str}': {e}")
+
                     if link not in seen:
                         seen.add(link)
                         desc_html = job.get("jobDescription", job.get("description", ""))
@@ -1176,12 +1467,20 @@ async def run_scraper_async(application):
         indeed_jobs = []
         
     await asyncio.sleep(2)
+    
+    try:
+        simplyhired_jobs = await asyncio.to_thread(scrape_simplyhired, seen)
+    except Exception as e:
+        log.error(f"SimplyHired scrape task failed: {e}")
+        simplyhired_jobs = []
+        
+    await asyncio.sleep(2)
         
     all_jobs = (
         linkedin_jobs + wellfound_jobs + internshala_jobs +
         glassdoor_jobs + cutshort_jobs + infopark_jobs +
         remotive_jobs + jobicy_jobs + arbeitnow_jobs + themuse_jobs +
-        indeed_jobs
+        indeed_jobs + simplyhired_jobs
     )
     await save_seen_jobs(seen)
     
@@ -1223,13 +1522,33 @@ async def run_scraper_async(application):
     stats["total_skipped_by_score_today"] += skipped_by_score_count
     stats["total_skipped_by_score"] += skipped_by_score_count
     
+    # Verify links of scored jobs concurrently
+    valid_scored_jobs = []
+    if scored_jobs:
+        log.info(f"Verifying apply links for {len(scored_jobs)} candidate jobs...")
+        async def verify_job(job_data, score_data):
+            link = job_data.get("link")
+            if await is_link_valid_async(link):
+                return (job_data, score_data)
+            else:
+                log.info(f"Skipping job {job_data['title']} at {job_data['company']} due to broken link: {link}")
+                return None
+        
+        tasks = [verify_job(job, score) for job, score in scored_jobs]
+        results = await asyncio.gather(*tasks)
+        valid_scored_jobs = [r for r in results if r is not None]
+    
+    skipped_by_link_count = len(scored_jobs) - len(valid_scored_jobs)
+    if skipped_by_link_count > 0:
+        log.info(f"Filtered out {skipped_by_link_count} job(s) with broken/invalid links.")
+
     # Sort best jobs first
-    scored_jobs.sort(key=lambda x: x[1]["score"], reverse=True)
+    valid_scored_jobs.sort(key=lambda x: x[1]["score"], reverse=True)
     
     sent_count = 0
-    if scored_jobs:
-        log.info(f"✅ {len(scored_jobs)} job(s) passed scoring. Sending to Telegram...")
-        for job, score_data in scored_jobs:
+    if valid_scored_jobs:
+        log.info(f"✅ {len(valid_scored_jobs)} job(s) passed scoring and link validation. Sending to Telegram...")
+        for job, score_data in valid_scored_jobs:
             msg = format_job_message(
                 job["title"], job["company"],
                 job["location"], job["link"],
@@ -1241,7 +1560,7 @@ async def run_scraper_async(application):
             sent_count += 1
             await asyncio.sleep(1)  # rate limit safety
     elif all_jobs:
-        log.info(f"🚫 {len(all_jobs)} job(s) found but all skipped (score/salary).")
+        log.info(f"🚫 {len(all_jobs)} job(s) found but all skipped (score/salary/link).")
     else:
         log.info("😴 No new matching jobs found.")
         
@@ -1525,7 +1844,7 @@ async def post_init(application):
     # Send startup message
     msg = (
         "🤖 <b>Job Alert Bot is now running!</b>\n\n"
-        "I'll ping you the moment a matching job drops on LinkedIn, Wellfound, Internshala, Remotive, Jobicy, Arbeitnow, or TheMuse.\n\n"
+        "I'll ping you the moment a matching job drops on LinkedIn, Wellfound, Internshala, Glassdoor, Infopark, Remotive, Jobicy, Arbeitnow, TheMuse, Indeed, or SimplyHired.\n\n"
         "<i>Checking every 30 minutes...</i>"
     )
     await send_telegram_async(application, msg)
